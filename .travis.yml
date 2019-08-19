@@ -1,0 +1,15 @@
+language: rust
+os:
+  - linux
+  - windows
+  - osx
+rust:
+  - nightly
+branches:
+  only:
+    - master
+script:
+  - cargo build
+  - cargo test
+env:
+  - RUST_BACKTRACE=1
