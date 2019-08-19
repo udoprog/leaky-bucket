@@ -366,6 +366,8 @@ mod tests {
         let mut rt = Runtime::new().expect("working runtime");
 
         rt.block_on(async move {
+            let interval = Duration::from_millis(20);
+
             let leaky = LeakyBucket::builder()
                 .tokens(0)
                 .max(10)
