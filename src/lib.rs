@@ -45,7 +45,7 @@
 use futures::{
     channel::mpsc::{self, Receiver, Sender},
     stream::StreamExt as _,
-    task::AtomicWaker,
+    task::Waker,
 };
 use parking_lot::Mutex;
 use std::{
@@ -164,11 +164,12 @@ impl Builder {
     }
 }
 
-struct Waker {
+/// A single queued task waiting to be woken up.
+struct Task {
     /// Amount required to wake up the given task.
     required: usize,
     /// Waker to call.
-    waker: AtomicWaker,
+    waker: Waker,
     /// Indicates if the task is completed.
     complete: Arc<AtomicBool>,
 }
@@ -183,9 +184,9 @@ struct Inner {
     /// Amount to add when refilling.
     refill_amount: usize,
     /// Sender for emitting queued tasks.
-    tx: Sender<Waker>,
+    tx: Sender<Task>,
     /// Receive tasks to wake up.
-    rx: Mutex<Option<Receiver<Waker>>>,
+    rx: Mutex<Option<Receiver<Task>>>,
 }
 
 impl Inner {
@@ -196,24 +197,25 @@ impl Inner {
             None => return Err(Error::AlreadyStarted),
         };
 
-        // The queue of wakers to process.
-        let mut wakers = VecDeque::new();
+        // The queue of tasks to process.
+        let mut tasks = VecDeque::new();
         // The interval at which we refill tokens.
         let mut interval = Interval::new_interval(self.refill_interval.clone()).fuse();
         // The current number of tokens accumulated locally.
         // This will increase until we have enough to satisfy the next waking task.
         let mut amount = 0;
+        let mut current = None;
 
-        loop {
+        'outer: loop {
             futures::select! {
                 waker = rx.select_next_some() => {
-                    wakers.push_back(waker);
+                    tasks.push_back(waker);
                 },
                 _ = interval.select_next_some() => {
                     amount += self.refill_amount;
 
-                    let waker = match wakers.front() {
-                        Some(waker) => waker,
+                    let mut task = match current.take().or_else(|| tasks.pop_front()) {
+                        Some(task) => task,
                         None => {
                             // Nothing to wake up, subtract the number of
                             // tokens immediately allowing future acquires to
@@ -221,30 +223,34 @@ impl Inner {
                             self.balance_tokens(amount);
                             amount = 0;
                             continue;
-                        },
+                        }
                     };
 
-                    while amount > 0 {
-                        let waker = match wakers.front() {
-                            Some(waker) => waker,
-                            None => break,
-                        };
-
-                        if amount < waker.required {
-                            break;
-                        }
-
+                    while amount > 0 && amount >= task.required {
                         // We have enough tokens to wake up the next task.
                         // Subtract it from the current amount and notify the task to wake up.
-                        amount -= waker.required;
-                        waker.complete.store(true, Ordering::Release);
-                        waker.waker.wake();
-                        wakers.pop_front();
+                        amount -= task.required;
+                        task.complete.store(true, Ordering::Release);
+                        task.waker.wake();
+
+                        task = match tasks.pop_front() {
+                            Some(task) => task,
+                            None => {
+                                if amount > 0 {
+                                    self.balance_tokens(amount);
+                                    amount = 0;
+                                }
+
+                                continue 'outer;
+                            },
+                        };
                     }
+
+                    current = Some(task);
 
                     // If there are no more queued tasks, make the remaining tokens available to
                     // the fast path.
-                    if wakers.is_empty() {
+                    if tasks.is_empty() {
                         self.balance_tokens(amount);
                     }
                 },
@@ -311,7 +317,7 @@ pub struct Acquire<'a> {
     tokens: &'a AtomicUsize,
     max: usize,
     amount: usize,
-    tx: Sender<Waker>,
+    tx: Sender<Task>,
     queued: Option<Arc<AtomicBool>>,
 }
 
@@ -344,20 +350,18 @@ impl Future for Acquire<'_> {
         }
 
         // queue up thread to be released once more tokens are available.
-        match self.tx.poll_ready(cx) {
-            Poll::Pending => return Poll::Pending,
-            Poll::Ready(Ok(())) => (),
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(Error::TaskSendError(e))),
+        match futures::ready!(self.tx.poll_ready(cx)) {
+            Ok(()) => (),
+            Err(e) => return Poll::Ready(Err(Error::TaskSendError(e))),
         }
 
-        let waker = AtomicWaker::new();
-        waker.register(cx.waker());
+        let waker = cx.waker().clone();
 
         let complete = Arc::new(AtomicBool::new(false));
 
         self.queued = Some(complete.clone());
 
-        if let Err(e) = self.tx.start_send(Waker {
+        if let Err(e) = self.tx.start_send(Task {
             required,
             waker,
             complete,
@@ -374,10 +378,11 @@ mod tests {
     use super::{Error, LeakyBucket};
     use futures::prelude::*;
     use std::time::{Duration, Instant};
+    use tokio::runtime::current_thread::Runtime;
+    use tokio_timer::Delay;
 
     #[test]
     fn test_leaky_bucket() {
-        use tokio::runtime::current_thread::Runtime;
         let mut rt = Runtime::new().expect("working runtime");
 
         rt.block_on(async move {
@@ -410,6 +415,57 @@ mod tests {
 
             assert_eq!(3, wakeups);
             assert!(duration.expect("expected measured duration") > interval * 2);
+        });
+    }
+
+    #[test]
+    fn test_concurrent_rate_limited() {
+        let mut rt = Runtime::new().expect("working runtime");
+
+        rt.block_on(async move {
+            let interval = Duration::from_millis(20);
+
+            let leaky = LeakyBucket::builder()
+                .tokens(0)
+                .max(10)
+                .refill_amount(1)
+                .refill_interval(interval)
+                .build();
+
+            let mut one_wakeups = 0;
+
+            let one = async {
+                loop {
+                    leaky.acquire(1).await?;
+                    one_wakeups += 1;
+                }
+
+                #[allow(unreachable_code)]
+                Ok::<_, Error>(())
+            };
+
+            let mut two_wakeups = 0;
+
+            let two = async {
+                loop {
+                    leaky.acquire(1).await?;
+                    two_wakeups += 1;
+                }
+
+                #[allow(unreachable_code)]
+                Ok::<_, Error>(())
+            };
+
+            let delay = Delay::new(Instant::now() + Duration::from_millis(200));
+
+            let task = future::select(one.boxed(), two.boxed());
+            let task = future::select(task, delay);
+
+            future::select(task, leaky.coordinate().boxed()).await;
+
+            let total = one_wakeups + two_wakeups;
+
+            assert!(total > 5 && total < 15);
         });
     }
 }
