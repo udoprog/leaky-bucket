@@ -35,7 +35,7 @@
 
 //!     println!("Waiting for permit...");
 //!     // should take about ten seconds to get a permit.
-//!     rate_limiter.acquire(100).await;
+//!     rate_limiter.acquire(100).await?;
 //!     println!("I made it!");
 //!
 //!     Ok(())
@@ -67,6 +67,8 @@ use tokio_timer::Interval;
 pub enum Error {
     /// The bucket has already been started.
     AlreadyStarted,
+    /// There was an issue enqueueing a task.
+    TaskSendError(mpsc::SendError),
 }
 
 impl fmt::Display for Error {
@@ -75,13 +77,17 @@ impl fmt::Display for Error {
 
         match self {
             AlreadyStarted => write!(fmt, "already started"),
+            TaskSendError(e) => write!(fmt, "failed to send task to coordinator: {}", e),
         }
     }
 }
 
 impl error::Error for Error {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        use self::Error::*;
+
         match self {
+            TaskSendError(e) => Some(e),
             _ => None,
         }
     }
@@ -190,9 +196,12 @@ impl Inner {
             None => return Err(Error::AlreadyStarted),
         };
 
+        // The queue of wakers to process.
         let mut wakers = VecDeque::new();
+        // The interval at which we refill tokens.
         let mut interval = Interval::new_interval(self.refill_interval.clone()).fuse();
-        // amount that has been refilled.
+        // The current number of tokens accumulated locally.
+        // This will increase until we have enough to satisfy the next waking task.
         let mut amount = 0;
 
         loop {
@@ -206,8 +215,8 @@ impl Inner {
                     let waker = match wakers.front() {
                         Some(waker) => waker,
                         None => {
-                            // NB: nothing to wake up, subtract the number of
-                            // tokens immediately allowing future acquire's to
+                            // Nothing to wake up, subtract the number of
+                            // tokens immediately allowing future acquires to
                             // enter the fast path.
                             self.balance_tokens(amount);
                             amount = 0;
@@ -225,13 +234,16 @@ impl Inner {
                             break;
                         }
 
-                        // NB: available = amount already added to the token bucket.
+                        // We have enough tokens to wake up the next task.
+                        // Subtract it from the current amount and notify the task to wake up.
                         amount -= waker.required;
                         waker.complete.store(true, Ordering::Release);
                         waker.waker.wake();
                         wakers.pop_front();
                     }
 
+                    // If there are no more queued tasks, make the remaining tokens available to
+                    // the fast path.
                     if wakers.is_empty() {
                         self.balance_tokens(amount);
                     }
@@ -304,13 +316,16 @@ pub struct Acquire<'a> {
 }
 
 impl Future for Acquire<'_> {
-    type Output = ();
+    type Output = Result<(), Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // if it has been woken up by the coordinator.
+        // Test if it has been woken up by the coordinator.
+        // If that is the case, complete should be `true`.
+        //
+        // Otherwise we are still pending.
         if let Some(complete) = &self.queued {
             return match complete.load(Ordering::Acquire) {
-                true => Poll::Ready(()),
+                true => Poll::Ready(Ok(())),
                 false => Poll::Pending,
             };
         }
@@ -318,12 +333,12 @@ impl Future for Acquire<'_> {
         let mut required = self.amount;
         let current = self.tokens.fetch_add(required, Ordering::AcqRel);
 
-        // fast path.
+        // fast path, we successfully acquired the number of tokens needed to proceed.
         while current + required < self.max {
-            return Poll::Ready(());
+            return Poll::Ready(Ok(()));
         }
 
-        // subtract the number of tokens already consumed.
+        // subtract the number of tokens already consumed from required.
         if current < self.max {
             required -= self.max - current;
         }
@@ -332,7 +347,7 @@ impl Future for Acquire<'_> {
         match self.tx.poll_ready(cx) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Ok(())) => (),
-            Poll::Ready(Err(e)) => panic!("failed to poll sender: {}", e),
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(Error::TaskSendError(e))),
         }
 
         let waker = AtomicWaker::new();
@@ -347,7 +362,7 @@ impl Future for Acquire<'_> {
             waker,
             complete,
         }) {
-            panic!("failed to queue sender: {}", e);
+            return Poll::Ready(Err(Error::TaskSendError(e)));
         }
 
         Poll::Pending
@@ -356,7 +371,7 @@ impl Future for Acquire<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::LeakyBucket;
+    use super::{Error, LeakyBucket};
     use futures::prelude::*;
     use std::time::{Duration, Instant};
 
@@ -380,13 +395,15 @@ mod tests {
 
             let test = async {
                 let start = Instant::now();
-                leaky.acquire(10).await;
+                leaky.acquire(10).await?;
                 wakeups += 1;
-                leaky.acquire(10).await;
+                leaky.acquire(10).await?;
                 wakeups += 1;
-                leaky.acquire(10).await;
+                leaky.acquire(10).await?;
                 wakeups += 1;
                 duration = Some(Instant::now().duration_since(start));
+
+                Ok::<_, Error>(())
             };
 
             futures::future::select(test.boxed(), leaky.coordinate().boxed()).await;
