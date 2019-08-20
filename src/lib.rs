@@ -17,18 +17,21 @@
 //! #![feature(async_await)]
 //!
 //! use futures::prelude::*;
-//! use leaky_bucket::LeakyBucket;
+//! use leaky_bucket::LeakyBuckets;
 //! use std::{error::Error, time::Duration};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn Error>> {
-//!     let rate_limiter = LeakyBucket::builder()
+//!     let buckets = LeakyBuckets::new();
+//!
+//!     let rate_limiter = buckets
+//!         .rate_limiter()
 //!         .max(100)
 //!         .refill_interval(Duration::from_secs(10))
 //!         .refill_amount(100)
-//!         .build();
+//!         .build()?;
 //!
-//!     let coordinator = rate_limiter.coordinate().boxed();
+//!     let coordinator = buckets.coordinate().boxed();
 //!
 //!     // spawn the coordinate thread to refill the rate limiter.
 //!     tokio::spawn(async move { coordinator.await.expect("coordinate thread errored") });
@@ -43,8 +46,8 @@
 //! ```
 
 use futures::{
-    channel::mpsc::{self, Receiver, Sender},
-    stream::StreamExt as _,
+    channel::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender},
+    stream::{FuturesUnordered, StreamExt as _},
     task::Waker,
 };
 use parking_lot::Mutex;
@@ -69,6 +72,8 @@ pub enum Error {
     AlreadyStarted,
     /// There was an issue enqueueing a task.
     TaskSendError(mpsc::SendError),
+    /// Failed to queue up new task.
+    NewTaskError,
 }
 
 impl fmt::Display for Error {
@@ -78,6 +83,7 @@ impl fmt::Display for Error {
         match self {
             AlreadyStarted => write!(fmt, "already started"),
             TaskSendError(e) => write!(fmt, "failed to send task to coordinator: {}", e),
+            NewTaskError => write!(fmt, "failed to queue up new task coordinator"),
         }
     }
 }
@@ -93,9 +99,79 @@ impl error::Error for Error {
     }
 }
 
+struct NewTask {
+    inner: Arc<Inner>,
+    rx: Receiver<Task>,
+}
+
+struct LeakyBucketsInner {
+    tx: UnboundedSender<NewTask>,
+    rx: Mutex<Option<UnboundedReceiver<NewTask>>>,
+}
+
+/// Coordinator for rate limiters. Is used to create new rate limiters as needed.
+#[derive(Clone)]
+pub struct LeakyBuckets {
+    inner: Arc<LeakyBucketsInner>,
+}
+
+impl LeakyBuckets {
+    /// Construct a new coordinator for rate limiters.
+    pub fn new() -> Self {
+        let (tx, rx) = mpsc::unbounded();
+
+        let inner = Arc::new(LeakyBucketsInner {
+            tx,
+            rx: Mutex::new(Some(rx)),
+        });
+
+        LeakyBuckets { inner }
+    }
+
+    /// Run the coordinator.
+    pub async fn coordinate(self) -> Result<(), Error> {
+        let mut rx = match self.inner.rx.lock().take() {
+            Some(rx) => rx,
+            None => return Err(Error::AlreadyStarted),
+        };
+
+        let mut futures = FuturesUnordered::new();
+
+        loop {
+            while futures.is_empty() {
+                futures::select! {
+                    NewTask { inner, rx } = rx.select_next_some() => {
+                        futures.push(inner.coordinate(rx));
+                    }
+                }
+            }
+
+            futures::select! {
+                _ = futures.next() => {
+                    panic!("coordinator task exited unexpectedly");
+                }
+                NewTask { inner, rx } = rx.select_next_some() => {
+                    futures.push(inner.coordinate(rx));
+                }
+            }
+        }
+    }
+
+    /// Construct a new rate limiter.
+    pub fn rate_limiter(&self) -> Builder {
+        Builder {
+            new_task_tx: self.inner.tx.clone(),
+            tokens: None,
+            max: None,
+            refill_interval: None,
+            refill_amount: None,
+        }
+    }
+}
+
 /// Builder for a leaky bucket.
-#[derive(Debug, Default, Clone)]
 pub struct Builder {
+    new_task_tx: UnboundedSender<NewTask>,
     tokens: Option<usize>,
     max: Option<usize>,
     refill_interval: Option<Duration>,
@@ -134,7 +210,7 @@ impl Builder {
     }
 
     /// Construct a new leaky bucket.
-    pub fn build(self) -> LeakyBucket {
+    pub fn build(self) -> Result<LeakyBucket, Error> {
         const DEFAULT_MAX: usize = 120;
         const DEFAULT_TOKENS: usize = 0;
         const DEFAULT_REFILL_INTERVAL: Duration = Duration::from_secs(1);
@@ -151,16 +227,22 @@ impl Builder {
 
         let (tx, rx) = mpsc::channel(1);
 
-        LeakyBucket {
-            inner: Arc::new(Inner {
-                tokens,
-                max,
-                refill_interval,
-                refill_amount,
-                tx,
-                rx: Mutex::new(Some(rx)),
-            }),
-        }
+        let inner = Arc::new(Inner {
+            tokens,
+            max,
+            refill_interval,
+            refill_amount,
+            tx,
+        });
+
+        self.new_task_tx
+            .unbounded_send(NewTask {
+                inner: inner.clone(),
+                rx,
+            })
+            .map_err(|_| Error::NewTaskError)?;
+
+        Ok(LeakyBucket { inner })
     }
 }
 
@@ -185,18 +267,11 @@ struct Inner {
     refill_amount: usize,
     /// Sender for emitting queued tasks.
     tx: Sender<Task>,
-    /// Receive tasks to wake up.
-    rx: Mutex<Option<Receiver<Task>>>,
 }
 
 impl Inner {
     /// Coordinate tasks.
-    async fn coordinate(self: Arc<Inner>) -> Result<(), Error> {
-        let mut rx = match self.rx.lock().take() {
-            Some(rx) => rx,
-            None => return Err(Error::AlreadyStarted),
-        };
-
+    async fn coordinate(self: Arc<Inner>, mut rx: Receiver<Task>) -> Result<(), Error> {
         // The queue of tasks to process.
         let mut tasks = VecDeque::new();
         // The interval at which we refill tokens.
@@ -258,7 +333,7 @@ impl Inner {
         }
     }
 
-    /// Subtracts the given amount of tokens.
+    /// Subtract the given amount of tokens, allowing them to be used by the fast path acquire.
     fn balance_tokens(&self, amount: usize) {
         let mut current = self.tokens.load(Ordering::Acquire);
 
@@ -285,16 +360,6 @@ pub struct LeakyBucket {
 }
 
 impl LeakyBucket {
-    /// Construct a new builder for a leaky bucket.
-    pub fn builder() -> Builder {
-        Builder::default()
-    }
-
-    /// Run the leaky bucket.
-    pub fn coordinate(&self) -> impl Future<Output = Result<(), Error>> {
-        self.inner.clone().coordinate()
-    }
-
     /// Acquire a single token.
     pub fn acquire_one(&self) -> Acquire<'_> {
         self.acquire(1)
@@ -375,7 +440,7 @@ impl Future for Acquire<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, LeakyBucket};
+    use super::{Error, LeakyBuckets};
     use futures::prelude::*;
     use std::time::{Duration, Instant};
     use tokio::runtime::current_thread::Runtime;
@@ -388,12 +453,16 @@ mod tests {
         rt.block_on(async move {
             let interval = Duration::from_millis(20);
 
-            let leaky = LeakyBucket::builder()
+            let buckets = LeakyBuckets::new();
+
+            let leaky = buckets
+                .rate_limiter()
                 .tokens(0)
                 .max(10)
                 .refill_amount(10)
                 .refill_interval(interval)
-                .build();
+                .build()
+                .expect("build rate limiter");
 
             let mut wakeups = 0;
             let mut duration = None;
@@ -411,7 +480,7 @@ mod tests {
                 Ok::<_, Error>(())
             };
 
-            futures::future::select(test.boxed(), leaky.coordinate().boxed()).await;
+            futures::future::select(test.boxed(), buckets.coordinate().boxed()).await;
 
             assert_eq!(3, wakeups);
             assert!(duration.expect("expected measured duration") > interval * 2);
@@ -425,12 +494,16 @@ mod tests {
         rt.block_on(async move {
             let interval = Duration::from_millis(20);
 
-            let leaky = LeakyBucket::builder()
+            let buckets = LeakyBuckets::new();
+
+            let leaky = buckets
+                .rate_limiter()
                 .tokens(0)
                 .max(10)
                 .refill_amount(1)
                 .refill_interval(interval)
-                .build();
+                .build()
+                .expect("build rate limiter");
 
             let mut one_wakeups = 0;
 
@@ -461,7 +534,7 @@ mod tests {
             let task = future::select(one.boxed(), two.boxed());
             let task = future::select(task, delay);
 
-            future::select(task, leaky.coordinate().boxed()).await;
+            future::select(task, buckets.coordinate().boxed()).await;
 
             let total = one_wakeups + two_wakeups;
 
