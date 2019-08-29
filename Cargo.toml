@@ -1,6 +1,6 @@
 [package]
 name = "leaky-bucket"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["John-John Tedro <udoprog@tedro.se>"]
 edition = "2018"
 license = "MIT/Apache-2.0"
@@ -13,11 +13,26 @@ Futures-aware rate limiter implementation.
 """
 categories = ["algorithms", "network-programming", "concurrency"]
 
+[features]
+default = ["tokio01"]
+tokio01 = ["tokio01-timer"]
+tokio02 = ["tokio02-timer"]
+
 [dependencies]
-futures-preview = {version = "0.3.0-alpha.17", features = ["async-await", "nightly"]}
+futures-preview = {version = "0.3.0-alpha.17", features = ["async-await", "nightly", "compat"]}
 log = "0.4.7"
 parking_lot = "0.9.0"
-tokio-timer = {version = "0.3.0-alpha.2", features = ["async-traits"]}
+
+[dependencies.tokio02-timer]
+package = "tokio-timer"
+version = "0.3.0-alpha.2"
+features = ["async-traits"]
+optional = true
+
+[dependencies.tokio01-timer]
+package = "tokio-timer"
+version = "0.2.11"
+optional = true
 
 [dev-dependencies]
 pin-utils = "0.1.0-alpha.4"

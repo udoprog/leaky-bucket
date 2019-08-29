@@ -10,6 +10,6 @@ branches:
     - master
 script:
   - cargo build
-  - cargo test
+  - cargo test --no-default-features --features tokio02
 env:
   - RUST_BACKTRACE=1
