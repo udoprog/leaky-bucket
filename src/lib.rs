@@ -1,5 +1,4 @@
 #![recursion_limit = "256"]
-#![feature(async_await)]
 #![deny(missing_docs)]
 //! # tokio-based leaky-bucket rate limiter
 //!
@@ -63,7 +62,31 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
-use tokio_timer::Interval;
+
+#[cfg(feature = "tokio02-timer")]
+mod tokio {
+    use futures::stream::StreamExt as _;
+    use std::time::Duration;
+
+    pub type Interval = futures::stream::Fuse<tokio02_timer::Interval>;
+
+    pub fn interval(duration: Duration) -> Interval {
+        tokio02_timer::Interval::new_interval(duration).fuse()
+    }
+}
+
+#[cfg(feature = "tokio01-timer")]
+mod tokio {
+    use futures::stream::StreamExt as _;
+    use std::time::Duration;
+
+    pub type Interval =
+        futures::stream::Fuse<futures::compat::Compat01As03<tokio01_timer::Interval>>;
+
+    pub fn interval(duration: Duration) -> Interval {
+        futures::compat::Compat01As03::new(tokio01_timer::Interval::new_interval(duration)).fuse()
+    }
+}
 
 /// Error type for the rate limiter.
 #[derive(Debug)]
@@ -275,7 +298,7 @@ impl Inner {
         // The queue of tasks to process.
         let mut tasks = VecDeque::new();
         // The interval at which we refill tokens.
-        let mut interval = Interval::new_interval(self.refill_interval.clone()).fuse();
+        let mut interval = self::tokio::interval(self.refill_interval.clone());
         // The current number of tokens accumulated locally.
         // This will increase until we have enough to satisfy the next waking task.
         let mut amount = 0;
@@ -443,8 +466,7 @@ mod tests {
     use super::{Error, LeakyBuckets};
     use futures::prelude::*;
     use std::time::{Duration, Instant};
-    use tokio::runtime::current_thread::Runtime;
-    use tokio_timer::Delay;
+    use tokio::{runtime::current_thread::Runtime, timer};
 
     #[test]
     fn test_leaky_bucket() {
@@ -529,7 +551,7 @@ mod tests {
                 Ok::<_, Error>(())
             };
 
-            let delay = Delay::new(Instant::now() + Duration::from_millis(200));
+            let delay = timer::Delay::new(Instant::now() + Duration::from_millis(200));
 
             let task = future::select(one.boxed(), two.boxed());
             let task = future::select(task, delay);

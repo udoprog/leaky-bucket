@@ -1,5 +1,3 @@
-#![feature(async_await)]
-
 use futures::prelude::*;
 use leaky_bucket::LeakyBuckets;
 use std::{error::Error, time::Duration};
