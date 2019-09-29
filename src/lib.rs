@@ -13,8 +13,6 @@
 //! ## Example
 //!
 //! ```no_run
-//! #![feature(async_await)]
-//!
 //! use futures::prelude::*;
 //! use leaky_bucket::LeakyBuckets;
 //! use std::{error::Error, time::Duration};
@@ -551,7 +549,7 @@ mod tests {
                 Ok::<_, Error>(())
             };
 
-            let delay = timer::Delay::new(Instant::now() + Duration::from_millis(200));
+            let delay = timer::delay(Instant::now() + Duration::from_millis(200));
 
             let task = future::select(one.boxed(), two.boxed());
             let task = future::select(task, delay);

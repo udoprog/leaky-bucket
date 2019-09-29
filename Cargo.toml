@@ -14,7 +14,7 @@ Futures-aware rate limiter implementation.
 categories = ["algorithms", "network-programming", "concurrency"]
 
 [features]
-default = ["tokio01"]
+default = ["tokio02"]
 tokio01 = ["tokio01-timer"]
 tokio02 = ["tokio02-timer"]
 
@@ -25,7 +25,7 @@ parking_lot = "0.9.0"
 
 [dependencies.tokio02-timer]
 package = "tokio-timer"
-version = "0.3.0-alpha.2"
+version = "0.3.0-alpha.5"
 features = ["async-traits"]
 optional = true
 
@@ -36,4 +36,4 @@ optional = true
 
 [dev-dependencies]
 pin-utils = "0.1.0-alpha.4"
-tokio = "0.2.0-alpha.2"
+tokio = "0.2.0-alpha.5"

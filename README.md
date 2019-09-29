@@ -11,8 +11,10 @@ This project is a rate limiter based on the [leaky bucket] algorithm.
 This library requires the user to add the following dependencies to use:
 
 ```toml
-leaky-bucket = "0.1.0"
+leaky-bucket = { version = "0.3.0", features = ["tokio02"] }
 ```
+
+Note: this project has to be built with the feature corresponding to the tokio version to use: `tokio02` for `tokio-0.2` and `tokio01` for `tokio-0.1`.
 
 ## Examples
 
