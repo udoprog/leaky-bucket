@@ -4,12 +4,13 @@ os:
   - windows
   - osx
 rust:
+  - beta
   - nightly
 branches:
   only:
     - master
 script:
-  - cargo build --features tokio02
-  - cargo test --features tokio02
+  - cargo build
+  - cargo test
 env:
   - RUST_BACKTRACE=1

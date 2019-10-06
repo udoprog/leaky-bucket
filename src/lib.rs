@@ -42,12 +42,11 @@
 //! }
 //! ```
 
-use futures::{
-    channel::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender},
+use futures_channel::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender};
+use futures_util::{
+    ready, select,
     stream::{FuturesUnordered, StreamExt as _},
-    task::Waker,
 };
-use parking_lot::Mutex;
 use std::{
     collections::VecDeque,
     error, fmt,
@@ -55,36 +54,11 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
     time::Duration,
 };
-
-#[cfg(feature = "tokio02-timer")]
-mod tokio {
-    use futures::stream::StreamExt as _;
-    use std::time::Duration;
-
-    pub type Interval = futures::stream::Fuse<tokio02_timer::Interval>;
-
-    pub fn interval(duration: Duration) -> Interval {
-        tokio02_timer::Interval::new_interval(duration).fuse()
-    }
-}
-
-#[cfg(feature = "tokio01-timer")]
-mod tokio {
-    use futures::stream::StreamExt as _;
-    use std::time::Duration;
-
-    pub type Interval =
-        futures::stream::Fuse<futures::compat::Compat01As03<tokio01_timer::Interval>>;
-
-    pub fn interval(duration: Duration) -> Interval {
-        futures::compat::Compat01As03::new(tokio01_timer::Interval::new_interval(duration)).fuse()
-    }
-}
 
 /// Error type for the rate limiter.
 #[derive(Debug)]
@@ -136,6 +110,12 @@ pub struct LeakyBuckets {
     inner: Arc<LeakyBucketsInner>,
 }
 
+impl Default for LeakyBuckets {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LeakyBuckets {
     /// Construct a new coordinator for rate limiters.
     pub fn new() -> Self {
@@ -151,7 +131,7 @@ impl LeakyBuckets {
 
     /// Run the coordinator.
     pub async fn coordinate(self) -> Result<(), Error> {
-        let mut rx = match self.inner.rx.lock().take() {
+        let mut rx = match self.inner.rx.lock().expect("ok mutex").take() {
             Some(rx) => rx,
             None => return Err(Error::AlreadyStarted),
         };
@@ -160,14 +140,14 @@ impl LeakyBuckets {
 
         loop {
             while futures.is_empty() {
-                futures::select! {
+                select! {
                     NewTask { inner, rx } = rx.select_next_some() => {
                         futures.push(inner.coordinate(rx));
                     }
                 }
             }
 
-            futures::select! {
+            select! {
                 _ = futures.next() => {
                     panic!("coordinator task exited unexpectedly");
                 }
@@ -239,9 +219,7 @@ impl Builder {
 
         let max = self.max.unwrap_or(DEFAULT_MAX);
         let tokens = max.saturating_sub(self.tokens.unwrap_or(DEFAULT_TOKENS));
-        let refill_interval = self
-            .refill_interval
-            .unwrap_or(DEFAULT_REFILL_INTERVAL.clone());
+        let refill_interval = self.refill_interval.unwrap_or(DEFAULT_REFILL_INTERVAL);
         let refill_amount = self.refill_amount.unwrap_or(DEFAULT_REFILL_AMOUNT);
 
         let tokens = AtomicUsize::new(tokens);
@@ -296,14 +274,14 @@ impl Inner {
         // The queue of tasks to process.
         let mut tasks = VecDeque::new();
         // The interval at which we refill tokens.
-        let mut interval = self::tokio::interval(self.refill_interval.clone());
+        let mut interval = tokio_timer::Interval::new_interval(self.refill_interval);
         // The current number of tokens accumulated locally.
         // This will increase until we have enough to satisfy the next waking task.
         let mut amount = 0;
         let mut current = None;
 
         'outer: loop {
-            futures::select! {
+            select! {
                 waker = rx.select_next_some() => {
                     tasks.push_back(waker);
                 },
@@ -416,9 +394,10 @@ impl Future for Acquire<'_> {
         //
         // Otherwise we are still pending.
         if let Some(complete) = &self.queued {
-            return match complete.load(Ordering::Acquire) {
-                true => Poll::Ready(Ok(())),
-                false => Poll::Pending,
+            return if complete.load(Ordering::Acquire) {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
             };
         }
 
@@ -426,7 +405,7 @@ impl Future for Acquire<'_> {
         let current = self.tokens.fetch_add(required, Ordering::AcqRel);
 
         // fast path, we successfully acquired the number of tokens needed to proceed.
-        while current + required < self.max {
+        if current + required < self.max {
             return Poll::Ready(Ok(()));
         }
 
@@ -436,7 +415,7 @@ impl Future for Acquire<'_> {
         }
 
         // queue up thread to be released once more tokens are available.
-        match futures::ready!(self.tx.poll_ready(cx)) {
+        match ready!(self.tx.poll_ready(cx)) {
             Ok(()) => (),
             Err(e) => return Poll::Ready(Err(Error::TaskSendError(e))),
         }
