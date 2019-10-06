@@ -209,7 +209,7 @@ dependencies = [
 
 [[package]]
 name = "leaky-bucket"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "futures-channel-preview 0.3.0-alpha.19 (registry+https://github.com/rust-lang/crates.io-index)",
  "futures-preview 0.3.0-alpha.19 (registry+https://github.com/rust-lang/crates.io-index)",
