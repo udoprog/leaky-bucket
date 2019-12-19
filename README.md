@@ -11,16 +11,12 @@ This project is a rate limiter based on the [leaky bucket] algorithm.
 This library requires the user to add the following dependencies to use:
 
 ```toml
-leaky-bucket = { version = "0.3.0", features = ["tokio02"] }
+leaky-bucket = "0.5.0"
 ```
-
-Note: this project has to be built with the feature corresponding to the tokio version to use: `tokio02` for `tokio-0.2` and `tokio01` for `tokio-0.1`.
 
 ## Examples
 
 ```rust
-#![feature(async_await)]
-
 use futures::prelude::*;
 use leaky_bucket::LeakyBuckets;
 use std::{error::Error, time::Duration};
