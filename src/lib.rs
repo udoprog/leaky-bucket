@@ -274,7 +274,7 @@ impl Inner {
         // The queue of tasks to process.
         let mut tasks = VecDeque::new();
         // The interval at which we refill tokens.
-        let mut interval = tokio_timer::Interval::new_interval(self.refill_interval);
+        let mut interval = tokio::time::interval(self.refill_interval).fuse();
         // The current number of tokens accumulated locally.
         // This will increase until we have enough to satisfy the next waking task.
         let mut amount = 0;
@@ -443,101 +443,93 @@ mod tests {
     use super::{Error, LeakyBuckets};
     use futures::prelude::*;
     use std::time::{Duration, Instant};
-    use tokio::{runtime::current_thread::Runtime, timer};
+    use tokio::time;
 
-    #[test]
-    fn test_leaky_bucket() {
-        let mut rt = Runtime::new().expect("working runtime");
+    #[tokio::test]
+    async fn test_leaky_bucket() {
+        let interval = Duration::from_millis(20);
 
-        rt.block_on(async move {
-            let interval = Duration::from_millis(20);
+        let buckets = LeakyBuckets::new();
 
-            let buckets = LeakyBuckets::new();
+        let leaky = buckets
+            .rate_limiter()
+            .tokens(0)
+            .max(10)
+            .refill_amount(10)
+            .refill_interval(interval)
+            .build()
+            .expect("build rate limiter");
 
-            let leaky = buckets
-                .rate_limiter()
-                .tokens(0)
-                .max(10)
-                .refill_amount(10)
-                .refill_interval(interval)
-                .build()
-                .expect("build rate limiter");
+        let mut wakeups = 0u32;
+        let mut duration = None;
 
-            let mut wakeups = 0;
-            let mut duration = None;
+        let test = async {
+            let start = Instant::now();
+            leaky.acquire(10).await?;
+            wakeups += 1;
+            leaky.acquire(10).await?;
+            wakeups += 1;
+            leaky.acquire(10).await?;
+            wakeups += 1;
+            duration = Some(Instant::now().duration_since(start));
 
-            let test = async {
-                let start = Instant::now();
-                leaky.acquire(10).await?;
-                wakeups += 1;
-                leaky.acquire(10).await?;
-                wakeups += 1;
-                leaky.acquire(10).await?;
-                wakeups += 1;
-                duration = Some(Instant::now().duration_since(start));
+            Ok::<_, Error>(())
+        };
 
-                Ok::<_, Error>(())
-            };
+        futures::future::select(test.boxed(), buckets.coordinate().boxed()).await;
 
-            futures::future::select(test.boxed(), buckets.coordinate().boxed()).await;
-
-            assert_eq!(3, wakeups);
-            assert!(duration.expect("expected measured duration") > interval * 2);
-        });
+        assert_eq!(3, wakeups);
+        assert!(duration.expect("expected measured duration") > interval * 2);
     }
 
-    #[test]
-    fn test_concurrent_rate_limited() {
-        let mut rt = Runtime::new().expect("working runtime");
+    #[tokio::test]
+    async fn test_concurrent_rate_limited() {
+        let interval = Duration::from_millis(20);
 
-        rt.block_on(async move {
-            let interval = Duration::from_millis(20);
+        let buckets = LeakyBuckets::new();
 
-            let buckets = LeakyBuckets::new();
+        let leaky = buckets
+            .rate_limiter()
+            .tokens(0)
+            .max(10)
+            .refill_amount(1)
+            .refill_interval(interval)
+            .build()
+            .expect("build rate limiter");
 
-            let leaky = buckets
-                .rate_limiter()
-                .tokens(0)
-                .max(10)
-                .refill_amount(1)
-                .refill_interval(interval)
-                .build()
-                .expect("build rate limiter");
+        let mut one_wakeups = 0;
 
-            let mut one_wakeups = 0;
+        let one = async {
+            loop {
+                leaky.acquire(1).await?;
+                one_wakeups += 1;
+            }
 
-            let one = async {
-                loop {
-                    leaky.acquire(1).await?;
-                    one_wakeups += 1;
-                }
+            #[allow(unreachable_code)]
+            Ok::<_, Error>(())
+        };
 
-                #[allow(unreachable_code)]
-                Ok::<_, Error>(())
-            };
+        let mut two_wakeups = 0;
 
-            let mut two_wakeups = 0;
+        let two = async {
+            loop {
+                leaky.acquire(1).await?;
+                two_wakeups += 1;
+            }
 
-            let two = async {
-                loop {
-                    leaky.acquire(1).await?;
-                    two_wakeups += 1;
-                }
+            #[allow(unreachable_code)]
+            Ok::<_, Error>(())
+        };
 
-                #[allow(unreachable_code)]
-                Ok::<_, Error>(())
-            };
+        let delay = time::delay_for(Duration::from_millis(200));
 
-            let delay = timer::delay(Instant::now() + Duration::from_millis(200));
+        let task = future::select(one.boxed(), two.boxed());
+        let task = future::select(task, delay);
 
-            let task = future::select(one.boxed(), two.boxed());
-            let task = future::select(task, delay);
+        future::select(task, buckets.coordinate().boxed()).await;
 
-            future::select(task, buckets.coordinate().boxed()).await;
+        let total = one_wakeups + two_wakeups;
 
-            let total = one_wakeups + two_wakeups;
-
-            assert!(total > 5 && total < 15);
-        });
+        assert!(total > 5 && total < 15);
     }
 }
