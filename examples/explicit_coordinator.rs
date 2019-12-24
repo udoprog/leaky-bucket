@@ -1,9 +1,15 @@
-use leaky_bucket::LeakyBucket;
+use leaky_bucket::LeakyBuckets;
 use std::{error::Error, time::Duration};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let rate_limiter = LeakyBucket::builder()
+    let mut buckets = LeakyBuckets::new();
+    let coordinator = buckets.coordinate()?;
+    // spawn the coordinate thread to refill the rate limiter.
+    tokio::spawn(async move { coordinator.await.expect("coordinate thread errored") });
+
+    let rate_limiter = buckets
+        .rate_limiter()
         .max(100)
         .refill_interval(Duration::from_secs(10))
         .refill_amount(100)

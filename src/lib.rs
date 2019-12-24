@@ -12,14 +12,42 @@
 //!
 //! ## Example
 //!
+//! If the project is built with the `static` feature (default), you can use
+//! `LeakyBucket` directly as long as you are inside a tokio runtime, like so:
+//!
 //! ```no_run
-//! use futures::prelude::*;
+//! use leaky_bucket::LeakyBucket;
+//! use std::{error::Error, time::Duration};
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn Error>> {
+//!     let rate_limiter = LeakyBucket::builder()
+//!         .max(100)
+//!         .refill_interval(Duration::from_secs(10))
+//!         .refill_amount(100)
+//!         .build()?;
+//!
+//!     println!("Waiting for permit...");
+//!     // should take about ten seconds to get a permit.
+//!     rate_limiter.acquire(100).await?;
+//!     println!("I made it!");
+//!
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ## Example using explicit coordinator
+//!
+//! ```no_run
 //! use leaky_bucket::LeakyBuckets;
 //! use std::{error::Error, time::Duration};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn Error>> {
-//!     let buckets = LeakyBuckets::new();
+//!     let mut buckets = LeakyBuckets::new();
+//!     let coordinator = buckets.coordinate()?;
+//!     // spawn the coordinate thread to refill the rate limiter.
+//!     tokio::spawn(async move { coordinator.await.expect("coordinate thread errored") });
 //!
 //!     let rate_limiter = buckets
 //!         .rate_limiter()
@@ -27,11 +55,6 @@
 //!         .refill_interval(Duration::from_secs(10))
 //!         .refill_amount(100)
 //!         .build()?;
-//!
-//!     let coordinator = buckets.coordinate().boxed();
-//!
-//!     // spawn the coordinate thread to refill the rate limiter.
-//!     tokio::spawn(async move { coordinator.await.expect("coordinate thread errored") });
 
 //!     println!("Waiting for permit...");
 //!     // should take about ten seconds to get a permit.
@@ -59,6 +82,16 @@ use std::{
     task::{Context, Poll, Waker},
     time::Duration,
 };
+
+#[cfg(feature = "static")]
+lazy_static::lazy_static! {
+    static ref LEAKY_BUCKETS: LeakyBuckets = {
+        let mut buckets = LeakyBuckets::new();
+        let coordinator = buckets.coordinate().expect("no other running coordinator");
+        tokio::spawn(async move { coordinator.await.expect("coordinate thread errored") });
+        buckets
+    };
+}
 
 /// Error type for the rate limiter.
 #[derive(Debug)]
@@ -130,32 +163,36 @@ impl LeakyBuckets {
     }
 
     /// Run the coordinator.
-    pub async fn coordinate(self) -> Result<(), Error> {
+    pub fn coordinate(
+        &mut self,
+    ) -> Result<impl Future<Output = Result<(), Error>> + 'static, Error> {
         let mut rx = match self.inner.rx.lock().expect("ok mutex").take() {
             Some(rx) => rx,
             None => return Err(Error::AlreadyStarted),
         };
 
-        let mut futures = FuturesUnordered::new();
+        Ok(async move {
+            let mut futures = FuturesUnordered::new();
 
-        loop {
-            while futures.is_empty() {
+            loop {
+                while futures.is_empty() {
+                    select! {
+                        NewTask { inner, rx } = rx.select_next_some() => {
+                            futures.push(inner.coordinate(rx));
+                        }
+                    }
+                }
+
                 select! {
+                    _ = futures.next() => {
+                        panic!("coordinator task exited unexpectedly");
+                    }
                     NewTask { inner, rx } = rx.select_next_some() => {
                         futures.push(inner.coordinate(rx));
                     }
                 }
             }
-
-            select! {
-                _ = futures.next() => {
-                    panic!("coordinator task exited unexpectedly");
-                }
-                NewTask { inner, rx } = rx.select_next_some() => {
-                    futures.push(inner.coordinate(rx));
-                }
-            }
-        }
+        })
     }
 
     /// Construct a new rate limiter.
@@ -359,6 +396,12 @@ pub struct LeakyBucket {
 }
 
 impl LeakyBucket {
+    /// Construct a new leaky bucket through a builder.
+    #[cfg(feature = "static")]
+    pub fn builder() -> Builder {
+        LEAKY_BUCKETS.rate_limiter()
+    }
+
     /// Acquire a single token.
     pub fn acquire_one(&self) -> Acquire<'_> {
         self.acquire(1)
@@ -449,7 +492,7 @@ mod tests {
     async fn test_leaky_bucket() {
         let interval = Duration::from_millis(20);
 
-        let buckets = LeakyBuckets::new();
+        let mut buckets = LeakyBuckets::new();
 
         let leaky = buckets
             .rate_limiter()
@@ -476,7 +519,7 @@ mod tests {
             Ok::<_, Error>(())
         };
 
-        futures::future::select(test.boxed(), buckets.coordinate().boxed()).await;
+        futures::future::select(test.boxed(), buckets.coordinate().unwrap().boxed()).await;
 
         assert_eq!(3, wakeups);
         assert!(duration.expect("expected measured duration") > interval * 2);
@@ -486,7 +529,7 @@ mod tests {
     async fn test_concurrent_rate_limited() {
         let interval = Duration::from_millis(20);
 
-        let buckets = LeakyBuckets::new();
+        let mut buckets = LeakyBuckets::new();
 
         let leaky = buckets
             .rate_limiter()
@@ -526,7 +569,7 @@ mod tests {
         let task = future::select(one.boxed(), two.boxed());
         let task = future::select(task, delay);
 
-        future::select(task, buckets.coordinate().boxed()).await;
+        future::select(task, buckets.coordinate().unwrap().boxed()).await;
 
         let total = one_wakeups + two_wakeups;
 
