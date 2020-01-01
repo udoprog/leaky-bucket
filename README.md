@@ -30,7 +30,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     println!("Waiting for permit...");
     // should take about ten seconds to get a permit.
-    rate_limiter.acquire(100).await?;
+    rate_limiter.acquire_one().await?;
     println!("I made it!");
 
     Ok(())
@@ -62,7 +62,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     println!("Waiting for permit...");
     // should take about ten seconds to get a permit.
-    rate_limiter.acquire(100).await?;
+    rate_limiter.acquire_one().await?;
     println!("I made it!");
 
     Ok(())
