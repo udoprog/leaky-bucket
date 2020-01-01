@@ -1,6 +1,8 @@
 # A leaky-bucket rate limiter
 
-[![Build Status](https://travis-ci.org/udoprog/leaky-bucket.svg?branch=master)](https://travis-ci.org/udoprog/leaky-bucket)
+[![Documentation](https://docs.rs/leaky-bucket/badge.svg)](https://docs.rs/leaky-bucket)
+[![Crates](https://img.shields.io/crates/v/leaky-bucket.svg)](https://crates.io/crates/leaky-bucket)
+[![Actions Status](https://github.com/udoprog/leaky-bucket/workflows/Rust/badge.svg)](https://github.com/udoprog/leaky-bucket/actions)
 
 A token-based rate limiter based on the [leaky bucket] algorithm.
 
