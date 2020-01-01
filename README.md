@@ -14,7 +14,7 @@ This library requires the user to add the following dependencies to use:
 leaky-bucket = "0.5.0"
 ```
 
-## Examples
+## Example
 
 ```rust
 use leaky_bucket::LeakyBucket;
@@ -37,7 +37,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 ```
 
-## Example with custom coordination
+## Example with custom coordinator
 
 Leaky buckets require coordination. By default, this will happen through a static coordinator spawned through `tokio::spawn` at first use.
 If you want to spawn the coordinator yourself, you can do the following with `LeakyBuckets`:
