@@ -13,7 +13,7 @@ A token-based rate limiter based on the [leaky bucket] algorithm.
 This library requires the user to add the following dependencies to use:
 
 ```toml
-leaky-bucket = "0.5.0"
+leaky-bucket = "0.7.1"
 ```
 
 ## Example
