@@ -1,6 +1,6 @@
 #![recursion_limit = "256"]
 #![deny(missing_docs)]
-//! # tokio-based leaky-bucket rate limiter
+//! # A leaky-bucket rate limiter
 //!
 //! This implements a leaky bucket from which you can acquire tokens.
 //!
