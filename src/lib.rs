@@ -337,7 +337,7 @@ impl Inner {
                         }
                     };
 
-                    while amount > 0 && amount >= task.required {
+                    while amount >= task.required {
                         // We have enough tokens to wake up the next task.
                         // Subtract it from the current amount and notify the task to wake up.
                         amount -= task.required;
@@ -371,6 +371,10 @@ impl Inner {
 
     /// Subtract the given amount of tokens, allowing them to be used by the fast path acquire.
     fn balance_tokens(&self, amount: usize) {
+        if amount == 0 {
+            return;
+        }
+
         let mut current = self.tokens.load(Ordering::Acquire);
 
         while current > 0 {
