@@ -296,13 +296,13 @@ struct Inner {
 }
 
 impl std::fmt::Debug for Inner {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "LeakyBucket {{ tokens: {}, max: {}, refill_interval: {:?}, refill_amount: {} }}",
-            self.tokens.load(Ordering::SeqCst),
-            self.max,
-            self.refill_interval,
-            self.refill_amount,
-        )
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fmt.debug_struct("LeakyBucket")
+            .field("tokens", &self.tokens.load(Ordering::SeqCst))
+            .field("max", &self.max)
+            .field("refill_interval", &self.refill_interval)
+            .field("refill_amount", &self.refill_amount)
+            .finish()
     }
 }
 
