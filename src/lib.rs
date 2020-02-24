@@ -295,6 +295,17 @@ struct Inner {
     task_tx: mpsc::Sender<Task>,
 }
 
+impl std::fmt::Debug for Inner {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fmt.debug_struct("LeakyBucket")
+            .field("tokens", &self.tokens.load(Ordering::SeqCst))
+            .field("max", &self.max)
+            .field("refill_interval", &self.refill_interval)
+            .field("refill_amount", &self.refill_amount)
+            .finish()
+    }
+}
+
 impl Inner {
     /// Coordinate tasks.
     async fn coordinate(self: Arc<Inner>, mut task_rx: mpsc::Receiver<Task>) -> Result<(), Error> {
@@ -381,6 +392,12 @@ impl Inner {
 #[derive(Clone)]
 pub struct LeakyBucket {
     inner: Arc<Inner>,
+}
+
+impl std::fmt::Debug for LeakyBucket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(f)
+    }
 }
 
 impl LeakyBucket {
@@ -634,6 +651,25 @@ mod tests {
     use futures::prelude::*;
     use std::time::{Duration, Instant};
     use tokio::time;
+
+    #[tokio::test]
+    async fn test_debug() {
+        let expected_debug = "LeakyBucket { tokens: 16, max: 20, refill_interval: 2s, refill_amount: 10 }";
+
+        let buckets = LeakyBuckets::new();
+        let leaky = buckets
+            .rate_limiter()
+            .tokens(5)
+            .max(20)
+            .refill_amount(10)
+            .refill_interval(Duration::from_millis(2000))
+            .build()
+            .expect("build rate limiter");
+        leaky.acquire_one().await.unwrap();
+
+        let actual_debug = format!("{:?}", leaky);
+        assert_eq!(expected_debug, &actual_debug);
+    }
 
     #[tokio::test]
     async fn test_leaky_bucket() {
