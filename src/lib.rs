@@ -654,7 +654,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_debug() {
-        let expected_debug = "LeakyBucket { tokens: 16, max: 20, refill_interval: 2s, refill_amount: 10 }";
+        let expected_debug =
+            "LeakyBucket { tokens: 16, max: 20, refill_interval: 2s, refill_amount: 10 }";
 
         let buckets = LeakyBuckets::new();
         let leaky = buckets
