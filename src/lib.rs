@@ -91,7 +91,6 @@ lazy_static::lazy_static! {
 
 /// Error type for the rate limiter.
 #[derive(Debug, Error)]
-#[non_exhaustive]
 pub enum Error {
     /// The bucket has already been started.
     #[error("Coordinator already started")]
