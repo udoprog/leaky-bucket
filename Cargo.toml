@@ -16,7 +16,7 @@ categories = ["algorithms", "network-programming", "concurrency"]
 [dependencies]
 futures-channel = "0.3.1"
 futures-util = "0.3.1"
-tokio = { version = "0.2.4", features = ["time", "stream"] }
+tokio = { version = "0.2.13", features = ["time", "stream", "rt-core"] }
 log = "0.4.7"
 lazy_static = { version = "1.4.0", optional = true }
 thiserror = "1.0.9"
