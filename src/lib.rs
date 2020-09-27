@@ -61,23 +61,18 @@
 //! }
 //! ```
 
-use futures_channel::mpsc;
-use futures_util::{
-    ready, select,
-    stream::{FuturesUnordered, StreamExt as _},
-};
+use futures_util::stream::FuturesUnordered;
 use std::{
-    collections::VecDeque,
     future::Future,
-    pin::Pin,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
         Arc,
     },
-    task::{Context, Poll, Waker},
     time::Duration,
 };
 use thiserror::Error;
+use tokio::stream::StreamExt as _;
+use tokio::sync::{mpsc, oneshot};
 
 #[cfg(feature = "static")]
 lazy_static::lazy_static! {
@@ -97,8 +92,11 @@ pub enum Error {
     #[error("Coordinator already started")]
     AlreadyStarted,
     /// There was an issue enqueueing a task.
-    #[error("Failed to send task to coordinator: {0}")]
-    TaskSendError(#[source] mpsc::SendError),
+    #[error("Failed to send task to coordinator")]
+    TaskSendError,
+    /// Issue when waiting for task coordinator to wake an acquire up.
+    #[error("Failed to wait for task coordinator")]
+    TaskWaitError,
     /// Failed to queue up new task.
     #[error("Failed to queue up new task coordinator")]
     NewTaskError,
@@ -131,8 +129,7 @@ impl Default for LeakyBuckets {
 impl LeakyBuckets {
     /// Construct a new coordinator for rate limiters.
     pub fn new() -> Self {
-        let (new_task_tx, new_task_rx) = mpsc::unbounded();
-
+        let (new_task_tx, new_task_rx) = mpsc::unbounded_channel();
         let inner = Arc::new(LeakyBucketsInner { new_task_tx });
 
         LeakyBuckets {
@@ -154,20 +151,14 @@ impl LeakyBuckets {
             let mut futures = FuturesUnordered::new();
 
             loop {
-                while futures.is_empty() {
-                    select! {
-                        NewTask { inner, task_rx } = new_task_rx.select_next_some() => {
-                            futures.push(inner.coordinate(task_rx));
-                        }
-                    }
-                }
-
-                select! {
-                    _ = futures.next() => {
-                        panic!("coordinator task exited unexpectedly");
-                    }
-                    NewTask { inner, task_rx } = new_task_rx.select_next_some() => {
+                tokio::select! {
+                    new_task = new_task_rx.recv() => {
+                        let NewTask { inner, task_rx } = new_task.expect("new task queue ended");
                         futures.push(inner.coordinate(task_rx));
+                    }
+                    result = futures.next(), if !futures.is_empty() => {
+                        let result = result.expect("workers ended");
+                        result?;
                     }
                 }
             }
@@ -252,7 +243,7 @@ impl Builder<'_> {
 
         self.new_task_tx
             .clone()
-            .unbounded_send(NewTask {
+            .send(NewTask {
                 inner: inner.clone(),
                 task_rx,
             })
@@ -266,10 +257,8 @@ impl Builder<'_> {
 struct Task {
     /// Amount required to wake up the given task.
     required: usize,
-    /// Waker to call.
-    waker: Waker,
-    /// Indicates if the task is completed.
-    complete: Arc<AtomicBool>,
+    /// Oneshot to trigger when the task completes.
+    completion: oneshot::Sender<()>,
 }
 
 struct Inner {
@@ -309,56 +298,53 @@ impl std::fmt::Debug for Inner {
 impl Inner {
     /// Coordinate tasks.
     async fn coordinate(self: Arc<Inner>, mut task_rx: mpsc::Receiver<Task>) -> Result<(), Error> {
-        // The queue of tasks to process.
-        let mut tasks = VecDeque::new();
+        use std::mem;
+
         let first = std::time::Instant::now()
             .checked_add(self.refill_interval)
             .unwrap_or_else(std::time::Instant::now);
+
         // The interval at which we refill tokens.
-        let mut interval = tokio::time::interval_at(first.into(), self.refill_interval).fuse();
+        let mut interval = tokio::time::interval_at(first.into(), self.refill_interval);
+
         // The current number of tokens accumulated locally.
         // This will increase until we have enough to satisfy the next waking task.
-        let mut amount = 0;
+        let mut amount = 0usize;
         let mut current = None;
 
-        'outer: loop {
-            select! {
-                waker = task_rx.select_next_some() => {
-                    tasks.push_back(waker);
+        loop {
+            tokio::select! {
+                task = task_rx.recv(), if current.is_none() => {
+                    if let Some(task) = task {
+                        current = Some(task);
+                    } else {
+                        // NB: shutdown.
+                        return Ok(());
+                    }
                 },
-                _ = interval.select_next_some() => {
-                    amount += self.refill_amount;
+                _ = interval.tick() => {
+                    amount = amount.saturating_add(self.refill_amount);
 
-                    let mut task = match current.take().or_else(|| tasks.pop_front()) {
+                    let task = match current.take() {
                         Some(task) => task,
                         None => {
                             // Nothing to wake up, subtract the number of
                             // tokens immediately allowing future acquires to
                             // enter the fast path.
-                            self.balance_tokens(amount);
-                            amount = 0;
+                            self.balance_tokens(mem::take(&mut amount));
                             continue;
                         }
                     };
 
-                    while amount >= task.required {
+                    if amount >= task.required {
                         // We have enough tokens to wake up the next task.
                         // Subtract it from the current amount and notify the task to wake up.
                         amount -= task.required;
-                        task.complete.store(true, Ordering::Release);
-                        task.waker.wake();
-
-                        task = match tasks.pop_front() {
-                            Some(task) => task,
-                            None => {
-                                self.balance_tokens(amount);
-                                amount = 0;
-                                continue 'outer;
-                            },
-                        };
+                        let result = task.completion.send(());
+                        debug_assert!(!result.is_err());
+                    } else {
+                        current = Some(task);
                     }
-
-                    current = Some(task);
                 },
             }
         }
@@ -481,15 +467,15 @@ impl LeakyBucket {
     /// }
     /// ```
     #[inline]
-    pub fn acquire_one(&self) -> Acquire<'_> {
-        self.acquire(1)
+    pub async fn acquire_one(&self) -> Result<(), Error> {
+        self.acquire(1).await
     }
 
     /// Acquire the given `amount` of tokens.
     ///
-    /// Note that you _are_ allowed to acquire more tokens than the current
+    /// Note that you *are* allowed to acquire more tokens than the current
     /// `max`, but the acquire will have to suspend the task until enough
-    /// tokens has built up to satisfy the acquire request.
+    /// tokens has built up to satisfy the request.
     ///
     /// # Example
     ///
@@ -526,122 +512,61 @@ impl LeakyBucket {
     /// acquired.
     ///
     /// [`Error::TokenOverflow`]: self::Error::TokenOverflow
-    pub fn acquire(&self, amount: usize) -> Acquire<'_> {
-        Acquire {
-            inner: &self.inner,
-            amount,
-            in_progress: None,
-            queued: None,
-        }
-    }
-}
+    pub async fn acquire(&self, amount: usize) -> Result<(), Error> {
+        let mut required = amount;
 
-/// Future associated with acquiring a single token.
-pub struct Acquire<'a> {
-    /// Reference to leaky bucket internals.
-    inner: &'a Inner,
-    /// The amount of tokens to acquire.
-    amount: usize,
-    // An owned Sender, used for sending the `Task` struct over.
-    // Only created lazily when necessary.
-    in_progress: Option<(mpsc::Sender<Task>, usize)>,
-    // State of a queued task, or if it was woken up.
-    // If defined, this needs to be checked when the task is woken to test if
-    // the current acquire is awake or not.
-    queued: Option<Arc<AtomicBool>>,
-}
-
-impl Future for Acquire<'_> {
-    type Output = Result<(), Error>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let Self {
-            ref inner,
-            ref mut in_progress,
-            ref mut queued,
-            amount,
-            ..
-        } = *self;
-
-        // Test if it has been woken up by the coordinator.
-        // If that is the case, complete should be `true`.
-        //
-        // Otherwise we are still pending.
-        if let Some(complete) = queued {
-            return if complete.load(Ordering::Acquire) {
-                Poll::Ready(Ok(()))
-            } else {
-                Poll::Pending
-            };
-        }
+        let mut current = self.inner.tokens.load(Ordering::Acquire);
+        let mut new;
 
         loop {
-            // handle send-in-progress.
-            if let Some((ref mut tx, required)) = *in_progress {
-                // queue up thread to be released once more tokens are available.
-                if let Err(e) = ready!(tx.poll_ready(cx)) {
-                    return Poll::Ready(Err(Error::TaskSendError(e)));
+            new = match current.checked_add(required) {
+                Some(new) => new,
+                None => {
+                    return Err(Error::TokenOverflow);
                 }
+            };
 
-                let complete = Arc::new(AtomicBool::new(false));
-                *queued = Some(complete.clone());
-
-                let task = Task {
-                    required,
-                    waker: cx.waker().clone(),
-                    complete,
-                };
-
-                if let Err(e) = tx.start_send(task) {
-                    return Poll::Ready(Err(Error::TaskSendError(e)));
-                }
-
-                return Poll::Pending;
-            }
-
-            let mut required = amount;
-
-            let mut current = inner.tokens.load(Ordering::Acquire);
-            let mut new;
-
-            loop {
-                new = match current.checked_add(required) {
-                    Some(new) => new,
-                    None => {
-                        return Poll::Ready(Err(Error::TokenOverflow));
-                    }
-                };
-
-                match inner.tokens.compare_exchange_weak(
-                    current,
-                    new,
-                    Ordering::SeqCst,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => break,
-                    Err(x) => {
-                        current = x;
-                    }
+            match self.inner.tokens.compare_exchange_weak(
+                current,
+                new,
+                Ordering::SeqCst,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(x) => {
+                    current = x;
                 }
             }
-
-            // fast path, we successfully acquired the number of tokens needed to proceed.
-            if new < inner.max {
-                return Poll::Ready(Ok(()));
-            }
-
-            // Slow path:
-            //
-            // Subtract the number of tokens already consumed from required and
-            // enqueue a task to be awoken when the given number of tokens is
-            // available.
-            if current < inner.max {
-                required -= inner.max - current;
-            }
-
-            // hand back the sender for the next time.
-            *in_progress = Some((inner.task_tx.clone(), required));
         }
+
+        // fast path, we successfully acquired the number of tokens needed to proceed.
+        if new < self.inner.max {
+            return Ok(());
+        }
+
+        // Slow path:
+        //
+        // Subtract the number of tokens already consumed from required and
+        // enqueue a task to be awoken when the given number of tokens is
+        // available.
+        if current < self.inner.max {
+            required -= self.inner.max - current;
+        }
+
+        let (completion, completion_rx) = oneshot::channel();
+
+        self.inner
+            .task_tx
+            .clone()
+            .send(Task {
+                required,
+                completion,
+            })
+            .await
+            .map_err(|_| Error::TaskSendError)?;
+
+        completion_rx.await.map_err(|_| Error::TaskWaitError)?;
+        Ok(())
     }
 }
 
