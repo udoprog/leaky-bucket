@@ -13,10 +13,18 @@
 //! the tokens will be suspended until the required number of tokens has been
 //! added.
 //!
+//! ## Usage
+//!
+//! Add the following to your `Cargo.toml`:
+//!
+//! ```toml
+//! leaky-bucket = "0.8.0"
+//! ```
+//!
 //! ## Example
 //!
 //! If the project is built with the `static` feature (default), you can use
-//! [LeakyBucket] directly as long as you are inside a tokio runtime, like so:
+//! [LeakyBucket] directly as long as you are inside a Tokio runtime, like so:
 //!
 //! ```no_run
 //! use leaky_bucket::LeakyBucket;
@@ -158,6 +166,23 @@ impl LeakyBuckets {
     }
 
     /// Run the coordinator.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use leaky_bucket::LeakyBuckets;
+    /// use std::{error::Error, time::Duration};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn Error>> {
+    /// let mut buckets = LeakyBuckets::new();
+    /// let coordinator = buckets.coordinate()?;
+    ///
+    /// // spawn the coordinate thread to refill the rate limiter.
+    /// tokio::spawn(async move { coordinator.await.expect("coordinator errored") });
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn coordinate(
         &mut self,
     ) -> Result<impl Future<Output = Result<(), Error>> + 'static, Error> {

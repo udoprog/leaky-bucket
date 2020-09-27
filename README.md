@@ -13,6 +13,14 @@ If the bucket overflows (i.e. goes over max), the task that tried to acquire
 the tokens will be suspended until the required number of tokens has been
 added.
 
+### Usage
+
+Add the following to your `Cargo.toml`:
+
+```toml
+leaky-bucket = "0.8.0"
+```
+
 ### Example
 
 If the project is built with the `static` feature (default), you can use
