@@ -193,19 +193,31 @@ impl LeakyBuckets {
 
         Ok(async move {
             let mut futures = FuturesUnordered::new();
+            let mut new_task_ended = false;
 
-            loop {
+            while !futures.is_empty() || !new_task_ended {
                 tokio::select! {
-                    new_task = new_task_rx.recv() => {
-                        let NewTask { inner, task_rx } = new_task.expect("new task queue ended");
+                    new_task = new_task_rx.recv(), if !new_task_ended => {
+                        let NewTask { inner, task_rx } = match new_task {
+                            Some(new_task) => new_task,
+                            None => {
+                                new_task_ended = true;
+                                continue;
+                            }
+                        };
+
                         futures.push(inner.coordinate(task_rx));
                     }
                     result = futures.next(), if !futures.is_empty() => {
-                        let result = result.expect("workers ended");
+                        // NB: this should never happen, since we check that the
+                        // stream is non-empty.
+                        let result = result.expect("worker queue ended");
                         result?;
                     }
                 }
             }
+
+            Ok(())
         })
     }
 
