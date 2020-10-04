@@ -193,19 +193,31 @@ impl LeakyBuckets {
 
         Ok(async move {
             let mut futures = FuturesUnordered::new();
+            let mut new_task_ended = false;
 
-            loop {
+            while !futures.is_empty() || !new_task_ended {
                 tokio::select! {
-                    new_task = new_task_rx.recv() => {
-                        let NewTask { inner, task_rx } = new_task.expect("new task queue ended");
+                    new_task = new_task_rx.recv(), if !new_task_ended => {
+                        let NewTask { inner, task_rx } = match new_task {
+                            Some(new_task) => new_task,
+                            None => {
+                                new_task_ended = true;
+                                continue;
+                            }
+                        };
+
                         futures.push(inner.coordinate(task_rx));
                     }
                     result = futures.next(), if !futures.is_empty() => {
-                        let result = result.expect("workers ended");
+                        // NB: this should never happen, since we check that the
+                        // stream is non-empty.
+                        let result = result.expect("worker queue ended");
                         result?;
                     }
                 }
             }
+
+            Ok(())
         })
     }
 
@@ -725,5 +737,33 @@ mod tests {
         let total = one_wakeups + two_wakeups;
 
         assert!(total > 5 && total < 15);
+    }
+
+    /// See: https://github.com/udoprog/leaky-bucket/issues/5#issuecomment-703205787
+    #[tokio::test]
+    async fn test_graceful_shutdown_coordinator() {
+        let interval = Duration::from_millis(20);
+
+        let mut buckets = LeakyBuckets::new();
+
+        let leaky = buckets
+            .rate_limiter()
+            .tokens(0)
+            .max(10)
+            .refill_amount(1)
+            .refill_interval(interval)
+            .build()
+            .expect("build rate limiter");
+
+        let coordinator = buckets.coordinate().unwrap();
+
+        let task = tokio::spawn(async move {
+            assert!(coordinator.await.is_ok());
+        });
+
+        drop(leaky);
+        drop(buckets);
+
+        task.await.unwrap();
     }
 }
