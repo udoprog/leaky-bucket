@@ -18,13 +18,13 @@ added.
 Add the following to your `Cargo.toml`:
 
 ```toml
-leaky-bucket = "0.8.0"
+leaky-bucket = "0.8.1"
 ```
 
 ### Example
 
 If the project is built with the `static` feature (default), you can use
-[LeakyBucket] directly as long as you are inside a tokio runtime, like so:
+[LeakyBucket] directly as long as you are inside a Tokio runtime, like so:
 
 ```rust
 use leaky_bucket::LeakyBucket;
