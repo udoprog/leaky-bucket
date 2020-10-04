@@ -738,4 +738,32 @@ mod tests {
 
         assert!(total > 5 && total < 15);
     }
+
+    /// See: https://github.com/udoprog/leaky-bucket/issues/5#issuecomment-703205787
+    #[tokio::test]
+    async fn test_graceful_shutdown_coordinator() {
+        let interval = Duration::from_millis(20);
+
+        let mut buckets = LeakyBuckets::new();
+
+        let leaky = buckets
+            .rate_limiter()
+            .tokens(0)
+            .max(10)
+            .refill_amount(1)
+            .refill_interval(interval)
+            .build()
+            .expect("build rate limiter");
+
+        let coordinator = buckets.coordinate().unwrap();
+
+        let task = tokio::spawn(async move {
+            assert!(coordinator.await.is_ok());
+        });
+
+        drop(leaky);
+        drop(buckets);
+
+        task.await.unwrap();
+    }
 }
