@@ -26,4 +26,4 @@ static = ["lazy_static", "tokio/rt-core"]
 
 [dev-dependencies]
 futures = "0.3.1"
-tokio = { version = "0.2.4", features = ["macros", "rt-core"] }
+tokio = { version = "0.2.4", features = ["full"] }
