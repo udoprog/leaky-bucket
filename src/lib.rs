@@ -93,6 +93,7 @@
 //! [`time` feature]: https://docs.rs/tokio/0.2.22/tokio/#feature-flags
 
 use futures_util::stream::FuturesUnordered;
+use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -363,44 +364,50 @@ impl Inner {
         // The current number of tokens accumulated locally.
         // This will increase until we have enough to satisfy the next waking task.
         let mut amount = 0usize;
-        let mut current = None;
+        let mut queue = VecDeque::new();
 
-        loop {
+        let mut task_rx_ended = false;
+
+        'outer: while !task_rx_ended || !queue.is_empty() {
             tokio::select! {
-                task = task_rx.recv(), if current.is_none() => {
+                task = task_rx.recv(), if !task_rx_ended => {
                     if let Some(task) = task {
-                        current = Some(task);
+                        queue.push_back(task);
                     } else {
-                        // NB: shutdown.
-                        return Ok(());
+                        task_rx_ended = true;
                     }
                 },
                 _ = interval.tick() => {
                     amount = amount.saturating_add(self.refill_amount);
 
-                    let task = match current.take() {
-                        Some(task) => task,
-                        None => {
-                            // Nothing to wake up, subtract the number of
-                            // tokens immediately allowing future acquires to
-                            // enter the fast path.
-                            self.balance_tokens(mem::take(&mut amount));
-                            continue;
-                        }
-                    };
+                    loop {
+                        let task = match queue.pop_front() {
+                            Some(task) => task,
+                            None => {
+                                // Nothing to wake up, subtract the number of
+                                // tokens immediately allowing future acquires to
+                                // enter the fast path.
+                                self.balance_tokens(mem::take(&mut amount));
+                                continue 'outer;
+                            }
+                        };
 
-                    if amount >= task.required {
+                        if amount < task.required {
+                            queue.push_front(task);
+                            break
+                        }
+
                         // We have enough tokens to wake up the next task.
                         // Subtract it from the current amount and notify the task to wake up.
                         amount -= task.required;
                         let result = task.completion.send(());
                         debug_assert!(!result.is_err());
-                    } else {
-                        current = Some(task);
                     }
                 },
             }
         }
+
+        Ok(())
     }
 
     /// Subtract the given amount of tokens, allowing them to be used by the fast path acquire.
