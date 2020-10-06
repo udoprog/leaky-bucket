@@ -18,7 +18,7 @@ added.
 Add the following to your `Cargo.toml`:
 
 ```toml
-leaky-bucket = "0.8.1"
+leaky-bucket = "0.8.2"
 ```
 
 ### Example
