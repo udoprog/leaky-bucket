@@ -734,7 +734,7 @@ mod tests {
             Ok::<_, Error>(())
         };
 
-        let delay = time::delay_for(Duration::from_millis(200));
+        let delay = time::sleep(Duration::from_millis(200));
 
         let task = future::select(one.boxed(), two.boxed());
         let task = future::select(task, delay);
