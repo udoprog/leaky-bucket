@@ -15,15 +15,15 @@ categories = ["algorithms", "network-programming", "concurrency"]
 
 [dependencies]
 futures-util = "0.3.1"
-tokio = { version = "0.2.22", features = ["time", "stream", "sync"] }
+tokio = { version = "0.3.0", features = ["macros", "time", "stream", "sync"] }
 log = "0.4.7"
 lazy_static = { version = "1.4.0", optional = true }
 thiserror = "1.0.9"
 
 [features]
 default = ["static"]
-static = ["lazy_static", "tokio/rt-core"]
+static = ["lazy_static", "tokio/rt"]
 
 [dev-dependencies]
 futures = "0.3.1"
-tokio = { version = "0.2.4", features = ["full"] }
+tokio = { version = "0.3.0", features = ["full"] }
