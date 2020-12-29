@@ -99,8 +99,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::stream::StreamExt as _;
 use tokio::sync::{mpsc, oneshot};
+use tokio_stream::StreamExt as _;
 
 #[cfg(feature = "static")]
 lazy_static::lazy_static! {
@@ -737,7 +737,7 @@ mod tests {
         let delay = time::sleep(Duration::from_millis(200));
 
         let task = future::select(one.boxed(), two.boxed());
-        let task = future::select(task, delay);
+        let task = future::select(task, delay.boxed());
 
         future::select(task, buckets.coordinate().unwrap().boxed()).await;
 
