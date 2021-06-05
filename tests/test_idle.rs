@@ -4,8 +4,8 @@
 use leaky_bucket::RateLimiter;
 use tokio::time;
 
-#[allow(unused)]
-async fn test_idle() {
+#[tokio::test]
+async fn test_idle_1() {
     let limiter = RateLimiter::builder()
         .refill(1)
         .interval(time::Duration::from_secs(2))
@@ -50,7 +50,7 @@ async fn test_idle_2() {
     assert!(elapsed.as_millis() >= 2000 && elapsed.as_millis() <= 2050);
 }
 
-#[allow(unused)]
+#[tokio::test]
 async fn test_idle_3() {
     let limiter = RateLimiter::builder()
         .refill(1)

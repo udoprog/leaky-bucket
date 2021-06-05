@@ -6,7 +6,7 @@ use std::time::Duration;
 async fn main() -> Result<()> {
     helpers::init_logging();
 
-    for iteration in 0..100 {
+    for iteration in 0..5 {
         let limiter = Arc::new(
             leaky_bucket::RateLimiter::builder()
                 .initial(100)
@@ -51,5 +51,6 @@ async fn main() -> Result<()> {
 
         assert_eq!(expected, globals);
     }
+
     Ok(())
 }
