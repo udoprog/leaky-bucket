@@ -224,6 +224,16 @@ const DEFAULT_REFILL_MAX_FACTOR: usize = 10;
 /// tasks from making progress so that they can unblock.
 const BUMP_LIMIT: usize = 16;
 
+/// Flag set when the first token in a bucket is observed. At this point an
+/// acquire task will attempt to update the last timestamp of the core.
+///
+/// It might also end up assuming the core if it's racing with another task
+/// trying to do the same.
+const FLAG_FIRST: usize = 0b0001;
+
+/// We have claimed exclusive access to the core.
+const FLAG_LOCK: usize = 0b0010;
+
 /// Linked task state.
 struct Task {
     /// Remaining tokens that need to be satisfied.
@@ -294,8 +304,8 @@ pub struct RateLimiter {
     fair: bool,
     /// Shared state of the rate limiter.
     waiters: Mutex<LinkedList<Task>>,
-    /// The core is owned by someone.
-    available: AtomicBool,
+    /// The state of the core.
+    flags: AtomicUsize,
     /// The current rate limiter core. This is exclusively used by the first
     /// task that blocks due to rate limiting and migrates from task to task.
     /// Access to the core is guarded by the `available` field.
@@ -645,7 +655,7 @@ impl Builder {
             max,
             fair: self.fair,
             waiters: Mutex::new(LinkedList::new()),
-            available: AtomicBool::new(true),
+            flags: AtomicUsize::new(0),
             core: UnsafeCell::new(core),
         }
     }
@@ -909,8 +919,13 @@ impl AcquireState {
         c.is_completed()
     }
 
-    /// Calculate and process the next core sleep.
-    fn next_sleep(&mut self, core: &mut Core, lim: &RateLimiter) -> Option<time::Duration> {
+    /// Assume the current core and calculate how long we must sleep for in
+    /// order to do it.
+    unsafe fn assume_core(&mut self, lim: &RateLimiter) -> Option<(Core, time::Duration)> {
+        self.core_link(lim);
+
+        let mut core = *lim.core.get();
+
         // Safety: we guard exclusive access to the core through the `available`
         // field.
         let last = core.last;
@@ -922,9 +937,10 @@ impl AcquireState {
         if d <= lim.interval {
             // We still have to wait for the remainder of an interval before we
             // can fill up with more tokens.
-            return Some(time::Duration::from_millis(
-                u64::try_from(lim.interval - d).unwrap_or(u64::MAX),
-            ));
+            let rem =
+                time::Duration::from_millis(u64::try_from(lim.interval - d).unwrap_or(u64::MAX));
+
+            return Some((core, rem));
         }
 
         // it is appropriate to immediately add more permits.
@@ -942,13 +958,13 @@ impl AcquireState {
         let mut waiters = lim.waiters.lock();
 
         if !self.refill(&mut waiters, refill, lim) {
-            return Some(rem);
+            return Some((core, rem));
         }
 
         // We synthetically "ran" at the current time minus the remaining time
         // we need to wait until the last update period.
         core.last = now - rem;
-        self.release(&mut *waiters, *core, lim);
+        self.release(&mut *waiters, core, lim);
         None
     }
 
@@ -965,7 +981,7 @@ impl AcquireState {
         }
 
         // Marks the core as available for anyone else to steal.
-        lim.available.store(true, Ordering::Release);
+        lim.flags.store(0, Ordering::Release);
 
         // Find another task that might take over as core. Once it has acquired
         // core status it will have to make sure it is no longer linked into the
@@ -1151,6 +1167,63 @@ where
                     // Test the fast path first, where we simply subtract
                     // the permits available from the current balance.
                     let old = lim.balance.fetch_add(this.permits, Ordering::AcqRel);
+
+                    // First token acquired, so record the timestamp at which it
+                    // was acquired so that interval calculations remain
+                    // accurate. We don't need to bother updating the timestamps
+                    // otherwise, because the rate limiter will remain under
+                    // contention at which point there will always be a core
+                    // around to do the interval work.
+                    if old == 0 {
+                        let flags = lim.flags.fetch_or(FLAG_FIRST, Ordering::AcqRel);
+
+                        // Either we've set the FIRST flag, or we raced with a
+                        // LOCK. If we raced with a LOCK we take over
+                        // responsiblity as core. Otherwise we try to update the
+                        // last seen timestamp and release the FIRST flag again.
+                        //
+                        // If this doesn't hold it simply means that the core
+                        // has already been assumed by some other process.
+                        if flags == 0 || flags == FLAG_LOCK {
+                            trace!("updating last timestamp");
+
+                            unsafe {
+                                (*lim.core.get()).last = time::Instant::now();
+                            }
+
+                            let flags = if flags == FLAG_LOCK {
+                                // No need to modify flags since we know we have
+                                // exclusive access now.
+                                flags
+                            } else {
+                                // Try to unlock the core, if we raced with a
+                                // LOCK, we take over as core.
+                                lim.flags.fetch_and(!FLAG_FIRST, Ordering::AcqRel)
+                            };
+
+                            if flags == FLAG_LOCK {
+                                unsafe {
+                                    let (core, rem) = match this.internal.assume_core(lim) {
+                                        Some(output) => output,
+                                        None => {
+                                            // Marks as completed.
+                                            this.state = State::Complete;
+                                            return Poll::Ready(());
+                                        }
+                                    };
+
+                                    trace!(sleep = ?rem, "taking over core from timestamp and sleeping");
+                                    this.state = State::Core {
+                                        core,
+                                        sleep: time::sleep(rem),
+                                    };
+                                }
+
+                                continue;
+                            }
+                        }
+                    }
+
                     let current = old.saturating_add(this.permits);
 
                     if current <= lim.max {
@@ -1180,26 +1253,22 @@ where
                             return Poll::Ready(());
                         }
 
+                        let flags = lim.flags.fetch_or(FLAG_LOCK, Ordering::AcqRel);
+
                         // Try to take over as core. If we're unsuccessful we just ensure
                         // that we're linked into the wait queue.
-                        if !lim.available.swap(false, Ordering::AcqRel) {
+                        if flags != 0 {
                             let mut waiters = lim.waiters.lock();
                             this.internal.update(&mut *waiters, cx.waker());
                             return Poll::Pending;
                         }
 
-                        let mut core = *lim.core.get();
-
-                        let rem = {
-                            this.internal.core_link(lim);
-
-                            match this.internal.next_sleep(&mut core, lim) {
-                                Some(rem) => rem,
-                                None => {
-                                    // Marks as completed.
-                                    this.state = State::Complete;
-                                    return Poll::Ready(());
-                                }
+                        let (core, rem) = match this.internal.assume_core(lim) {
+                            Some(output) => output,
+                            None => {
+                                // Marks as completed.
+                                this.state = State::Complete;
+                                return Poll::Ready(());
                             }
                         };
 
