@@ -13,7 +13,7 @@ struct Pointers<T> {
     prev: Option<ptr::NonNull<Node<T>>>,
     /// Avoids noalias heuristics from kicking in on references to a
     /// `Pointers<T>` struct.
-    _marker: marker::PhantomPinned,
+    _pin: marker::PhantomPinned,
 }
 
 pub struct Node<T> {
@@ -39,7 +39,7 @@ impl<T> Node<T> {
             pointers: UnsafeCell::new(Pointers {
                 next: None,
                 prev: None,
-                _marker: marker::PhantomPinned,
+                _pin: marker::PhantomPinned,
             }),
             value,
         }

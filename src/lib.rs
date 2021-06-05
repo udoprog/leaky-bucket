@@ -228,10 +228,7 @@ const BUMP_LIMIT: usize = 16;
 struct Task {
     /// Remaining tokens that need to be satisfied.
     remaining: usize,
-    /// If this node has been released or not. We make this an atomic to permit
-    /// access to it without synchronization and a raw pointer to ensure that we
-    /// don't violate unique aliasing associating with constructing mutable
-    /// references.
+    /// Link to [Linking::complete].
     complete: Option<ptr::NonNull<AtomicBool>>,
     /// The waker associated with the node.
     waker: Option<Waker>,
@@ -698,26 +695,296 @@ enum State {
 /// Internal state of the acquire. This is separated because it can be computed
 /// in constant time.
 struct AcquireState {
-    /// State of the acquisition.
-    state: State,
-    /// The linked up flag indicating if this task is completed or not.
-    complete: AtomicBool,
+    /// If we are linked or not.
+    linked: bool,
     /// Inner state of the acquire.
-    linking: Linking,
-    /// Acquire internals is self-referential and most definitely !Unpin.
-    _marker: marker::PhantomPinned,
+    linking: UnsafeCell<Linking>,
 }
 
 impl AcquireState {
     const INITIAL: AcquireState = AcquireState {
-        state: State::Initial,
-        complete: AtomicBool::new(false),
-        linking: Linking {
-            linked: false,
-            task: UnsafeCell::new(Node::new(Task::new())),
-        },
-        _marker: marker::PhantomPinned,
+        linked: false,
+        linking: UnsafeCell::new(Linking {
+            task: Node::new(Task::new()),
+            complete: AtomicBool::new(false),
+            _pin: marker::PhantomPinned,
+        }),
     };
+
+    /// Access the completion flag.
+    pub fn complete(&self) -> &AtomicBool {
+        // Safety: This is always safe to access since it's atomic.
+        unsafe {
+            let ptr = self.linking.get() as *const _ as *const Node<Task>;
+            let ptr = ptr.add(1) as *const AtomicBool;
+            &*ptr
+        }
+    }
+
+    /// Get the underlying task.
+    pub unsafe fn task(&self) -> &Node<Task> {
+        let ptr = self.linking.get() as *mut Node<Task>;
+        &*ptr
+    }
+
+    /// Get the underlying task mutably.
+    pub unsafe fn task_mut(&mut self) -> &mut Node<Task> {
+        let ptr = self.linking.get() as *mut Node<Task>;
+        &mut *ptr
+    }
+
+    /// Get the underlying task mutably and completion flag as a pair.
+    pub unsafe fn update_pair(&mut self) -> (&mut Node<Task>, &AtomicBool) {
+        let node = self.linking.get() as *mut Node<Task>;
+        let complete = node.add(1) as *const _ as *const AtomicBool;
+        let node = &mut *(node as *mut Node<Task>);
+        let complete = &*complete;
+        (node, complete)
+    }
+
+    /// Update the waiting state for this acquisition task. This might require
+    /// that we update the associated waker.
+    unsafe fn update(&mut self, waiters: &mut LinkedList<Task>, waker: &Waker) {
+        if !self.linked {
+            self.linked = true;
+            waiters.push_front(self.task_mut().into());
+        }
+
+        // Safety: we're ensured to do this under the waiters lock since we've
+        // passed the relevant guard in through `waiters`.
+        let (task, complete) = self.update_pair();
+
+        let w = &mut task.waker;
+
+        let new_waker = match w {
+            None => true,
+            Some(w) => !w.will_wake(waker),
+        };
+
+        if new_waker {
+            *w = Some(waker.clone());
+        }
+
+        if task.complete.is_none() {
+            task.complete = Some(complete.into());
+        }
+    }
+
+    // Ensure that the current core task is correctly linked up if needed.
+    unsafe fn core_link(&mut self, lim: &RateLimiter) {
+        if lim.fair {
+            // Fair scheduling needs to ensure that the core is part
+            // of the wait queue, and will be woken up in-order with
+            // other tasks.
+            if !self.linked {
+                self.linked = true;
+                let mut waiters = lim.waiters.lock();
+                waiters.push_front(self.task_mut().into());
+            }
+
+            return;
+        }
+
+        // The local count of permits is set to 0 once a task has been linked
+        // into the wait queue.
+        //
+        // The core task is not supposed to be in the wait queue, so remove it
+        // from there if we've successfully stolen it.
+        if !self.linked {
+            return;
+        }
+
+        // Ensure that the current task is *not* linked since it is now to
+        // become the coordinator for everyone else.
+        self.linked = false;
+        let mut waiters = lim.waiters.lock();
+        waiters.remove(self.task_mut().into());
+    }
+
+    /// Refill the worker and release core if appropriate.
+    unsafe fn refill_release(&mut self, core: &mut Core, lim: &RateLimiter) -> bool {
+        let mut waiters = lim.waiters.lock();
+
+        if self.refill(&mut waiters, lim.refill, lim) {
+            self.release(&mut *waiters, *core, lim);
+            return true;
+        }
+
+        false
+    }
+
+    /// Release the given number of tokens from the wait queue.
+    ///
+    /// Returns `true` if the current core has been completed and needs to be
+    /// released.
+    fn refill(
+        &mut self,
+        waiters: &mut MutexGuard<'_, LinkedList<Task>>,
+        refill: usize,
+        lim: &RateLimiter,
+    ) -> bool {
+        trace!(refill = refill, "refilling tokens");
+        let mut current = refill;
+
+        let mut bump = 0;
+
+        // Safety: we're holding the lock guard to all the waiters so we can be
+        // sure that we have exclusive access to the wait queue.
+        unsafe {
+            while current > 0 {
+                let mut node = match waiters.pop_back() {
+                    Some(node) => node,
+                    None => break,
+                };
+
+                let n = node.as_mut();
+                let before = n.remaining;
+                n.fill(&mut current);
+
+                trace! {
+                    current = current,
+                    before = before,
+                    remaining = n.remaining,
+                    "filled node",
+                };
+
+                if !n.is_completed() {
+                    waiters.push_back(node);
+                    break;
+                }
+
+                if let Some(complete) = n.complete.take() {
+                    complete.as_ref().store(true, Ordering::Release);
+                }
+
+                if let Some(waker) = n.waker.take() {
+                    waker.wake();
+                }
+
+                bump += 1;
+
+                if bump == BUMP_LIMIT {
+                    MutexGuard::bump(waiters);
+                    bump = 0;
+                }
+            }
+        }
+
+        if refill > 0 {
+            let mut old = lim.balance.load(Ordering::Relaxed);
+
+            loop {
+                let new = old.saturating_sub(refill);
+
+                match lim.balance.compare_exchange_weak(
+                    old,
+                    new,
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(x) => old = x,
+                }
+            }
+        }
+
+        if lim.fair {
+            // We only need to check the state since the current core holder is
+            // linked up to the wait queue.
+            //
+            // Safety: we're doing this under the waiters lock so we know we
+            // have exclusive access to the node.
+            return unsafe { self.task().is_completed() };
+        }
+
+        // If the limiter is not fair, we need to in addition to draining
+        // remaining tokens from linked nodes, drain it from ourselves. We fill
+        // the current holder of the core last (self). To ensure that it stays
+        // around for as long as possible.
+        //
+        // Safety: we know that no one else holds the task at this point. The
+        // in particular the task is not linked into the wait queue.
+        let c = unsafe { &mut *self.task_mut() };
+        c.fill(&mut current);
+        c.is_completed()
+    }
+
+    /// Calculate and process the next core sleep.
+    fn next_sleep(&mut self, core: &mut Core, lim: &RateLimiter) -> Option<time::Duration> {
+        // Safety: we guard exclusive access to the core through the `available`
+        // field.
+        let last = core.last;
+
+        let now = time::Instant::now();
+        let d =
+            usize::try_from(now.saturating_duration_since(last).as_millis()).unwrap_or(usize::MAX);
+
+        if d <= lim.interval {
+            // We still have to wait for the remainder of an interval before we
+            // can fill up with more tokens.
+            return Some(time::Duration::from_millis(
+                u64::try_from(lim.interval - d).unwrap_or(u64::MAX),
+            ));
+        }
+
+        // it is appropriate to immediately add more permits.
+        let refill_periods = d / lim.interval;
+
+        let rem = time::Duration::from_millis(u64::try_from(d % lim.interval).unwrap_or(u64::MAX));
+
+        debug_assert! {
+            refill_periods > 0,
+            "refill periods should be larger than 0"
+        };
+
+        let refill = refill_periods.saturating_mul(lim.refill);
+
+        let mut waiters = lim.waiters.lock();
+
+        if !self.refill(&mut waiters, refill, lim) {
+            return Some(rem);
+        }
+
+        // We synthetically "ran" at the current time minus the remaining time
+        // we need to wait until the last update period.
+        core.last = now - rem;
+        self.release(&mut *waiters, *core, lim);
+        None
+    }
+
+    /// Release the current core. Beyond this point the current task may no
+    /// longer interact exclusively with the core.
+    fn release(&mut self, waiters: &mut LinkedList<Task>, core: Core, lim: &RateLimiter) {
+        // Hand the state of the core back.
+        //
+        // Safety: we're doing this right before we unset the available flag,
+        // ensuring that we do indeed have exclusive access to the state of the
+        // core.
+        unsafe {
+            *lim.core.get() = core;
+        }
+
+        // Marks the core as available for anyone else to steal.
+        lim.available.store(true, Ordering::Release);
+
+        // Find another task that might take over as core. Once it has acquired
+        // core status it will have to make sure it is no longer linked into the
+        // wait queue.
+        //
+        // We have to do this, because another task might miss that the core is
+        // available since it's hidden behind an atomic, so we wake any task up
+        // to ensure that it will always be picked up.
+        //
+        // Safety: We're holding the lock guard to all the waiters so we can be
+        // certain that we have exclusive access.
+        unsafe {
+            if let Some(mut node) = waiters.front_mut() {
+                if let Some(waker) = node.as_mut().waker.take() {
+                    waker.wake();
+                }
+            }
+        }
+    }
 }
 
 /// The future associated with acquiring permits from a rate limiter using
@@ -829,6 +1096,8 @@ where
     /// Inner shared state.
     lim: T,
     permits: usize,
+    /// State of the acquisition.
+    state: State,
     internal: AcquireState,
 }
 
@@ -841,12 +1110,13 @@ where
         Self {
             lim,
             permits,
+            state: State::Initial,
             internal: AcquireState::INITIAL,
         }
     }
 
     fn is_core(&self) -> bool {
-        matches!(&self.internal.state, State::Core { .. })
+        matches!(&self.state, State::Core { .. })
     }
 }
 
@@ -866,7 +1136,7 @@ where
         let this = unsafe { self.get_unchecked_mut() };
 
         loop {
-            match &mut this.internal.state {
+            match &mut this.state {
                 State::Initial => {
                     let lim = this.lim.as_ref();
 
@@ -874,7 +1144,7 @@ where
                     // inspect the number of permits without having to
                     // synchronize.
                     if this.permits == 0 {
-                        this.internal.state = State::Complete;
+                        this.state = State::Complete;
                         return Poll::Ready(());
                     }
 
@@ -884,17 +1154,18 @@ where
                     let current = old.saturating_add(this.permits);
 
                     if current <= lim.max {
-                        this.internal.state = State::Complete;
+                        this.state = State::Complete;
                         return Poll::Ready(());
                     }
 
                     let remaining = usize::min(current - lim.max, this.permits);
 
                     unsafe {
-                        (*this.internal.linking.task.get()).remaining = remaining;
+                        this.internal.task_mut().remaining = remaining;
                     }
+
                     trace!("no immediate tokens available");
-                    this.internal.state = State::Waiting;
+                    this.state = State::Waiting;
                 }
                 State::Waiting => {
                     let lim = this.lim.as_ref();
@@ -904,8 +1175,8 @@ where
                         //
                         // This field is atomic, so we can safely read it under shared
                         // access and do not require a lock.
-                        if this.internal.complete.load(Ordering::Acquire) {
-                            this.internal.state = State::Complete;
+                        if this.internal.complete().load(Ordering::Acquire) {
+                            this.state = State::Complete;
                             return Poll::Ready(());
                         }
 
@@ -913,44 +1184,40 @@ where
                         // that we're linked into the wait queue.
                         if !lim.available.swap(false, Ordering::AcqRel) {
                             let mut waiters = lim.waiters.lock();
-                            this.internal.linking.update(
-                                &mut *waiters,
-                                cx.waker(),
-                                &this.internal.complete,
-                            );
+                            this.internal.update(&mut *waiters, cx.waker());
                             return Poll::Pending;
                         }
 
                         let mut core = *lim.core.get();
 
                         let rem = {
-                            this.internal.linking.core_link(lim);
+                            this.internal.core_link(lim);
 
-                            match this.internal.linking.next_sleep(&mut core, lim) {
+                            match this.internal.next_sleep(&mut core, lim) {
                                 Some(rem) => rem,
                                 None => {
                                     // Marks as completed.
-                                    this.internal.state = State::Complete;
+                                    this.state = State::Complete;
                                     return Poll::Ready(());
                                 }
                             }
                         };
 
                         trace!(sleep = ?rem, "taking over core and sleeping");
-                        this.internal.state = State::Core {
+                        this.state = State::Core {
                             core,
                             sleep: time::sleep(rem),
                         };
                     }
                 }
                 State::Core { core, sleep } => {
-                    let lim = this.lim.as_ref();
-
                     let mut sleep = unsafe { Pin::new_unchecked(sleep) };
 
                     if sleep.as_mut().poll(cx).is_pending() {
                         return Poll::Pending;
                     }
+
+                    let lim = this.lim.as_ref();
 
                     let now = time::Instant::now();
                     trace!(now = ?now, "sleep completed");
@@ -959,8 +1226,8 @@ where
                     // Safety: we know that we're the only one with access to core
                     // because we ensured it as we acquire the `available` lock.
                     unsafe {
-                        if this.internal.linking.refill_release(core, lim) {
-                            this.internal.state = State::Complete;
+                        if this.internal.refill_release(core, lim) {
+                            this.state = State::Complete;
                             return Poll::Ready(());
                         }
                     }
@@ -982,7 +1249,7 @@ where
     T: AsRef<RateLimiter>,
 {
     fn drop(&mut self) {
-        match &mut self.internal.state {
+        match &mut self.state {
             State::Waiting => {
                 let lim = self.lim.as_ref();
 
@@ -992,7 +1259,7 @@ where
                     // can do what we want with it.
                     let node = {
                         let mut waiters = lim.waiters.lock();
-                        let task = self.internal.linking.task.get_mut();
+                        let task = self.internal.task_mut();
                         waiters.remove(task.into());
                         task
                     };
@@ -1014,284 +1281,30 @@ where
                 let mut waiters = lim.waiters.lock();
 
                 if lim.fair {
-                    waiters.remove(self.internal.linking.task.get_mut().into());
+                    waiters.remove(self.internal.task_mut().into());
                 }
 
-                self.internal.linking.release(&mut *waiters, *core, lim);
+                self.internal.release(&mut *waiters, *core, lim);
             },
             _ => (),
         }
     }
 }
 
-/// Some state of the acquire broken up so we can satisfy the borrow checker
-/// more easily.
+/// All of the state that is linked into the wait queue.
+///
+/// This is only ever accessed through raw pointer manipulation to avoid issues
+/// with field aliasing.
+#[repr(C)]
 struct Linking {
-    /// If we are linked or not.
-    linked: bool,
-    /// The node in the linked list (if present).
-    task: UnsafeCell<Node<Task>>,
-}
-
-impl Linking {
-    /// Ensure that the current task is linked once into the shared queue.
-    unsafe fn link(&mut self, waiters: &mut LinkedList<Task>) {
-        debug_assert!(!self.linked);
-        self.linked = true;
-        waiters.push_front(self.task.get_mut().into());
-    }
-
-    /// Ensure that the current task is not linked in the wait queue.
-    ///
-    /// This is done once the current task steals the coordinator core.
-    unsafe fn unlink(&mut self, waiters: &mut LinkedList<Task>) {
-        debug_assert!(self.linked);
-        self.linked = false;
-        waiters.remove(self.task.get_mut().into());
-    }
-
-    /// Update the waiting state for this acquisition task. This might require
-    /// that we update the associated waker.
-    unsafe fn update(
-        &mut self,
-        waiters: &mut LinkedList<Task>,
-        waker: &Waker,
-        complete: &AtomicBool,
-    ) {
-        if !self.linked {
-            self.link(waiters);
-        }
-
-        // Safety: we're ensured to do this under the waiters lock since we've
-        // passed the relevant guard in through `waiters`.
-        let task = &mut *self.task.get();
-
-        let w = &mut task.waker;
-
-        let new_waker = match w {
-            None => true,
-            Some(w) => !w.will_wake(waker),
-        };
-
-        if new_waker {
-            *w = Some(waker.clone());
-        }
-
-        if task.complete.is_none() {
-            task.complete = Some(complete.into());
-        }
-    }
-
-    // Ensure that the current core task is correctly linked up if needed.
-    unsafe fn core_link(&mut self, lim: &RateLimiter) {
-        if lim.fair {
-            // Fair scheduling needs to ensure that the core is part
-            // of the wait queue, and will be woken up in-order with
-            // other tasks.
-            if !self.linked {
-                self.link(&mut *lim.waiters.lock());
-            }
-
-            return;
-        }
-
-        // The local count of permits is set to 0 once a task has been linked
-        // into the wait queue.
-        //
-        // The core task is not supposed to be in the wait queue, so remove it
-        // from there if we've successfully stolen it.
-        if !self.linked {
-            return;
-        }
-
-        // Ensure that the current task is *not* linked since it is now to
-        // become the coordinator for everyone else.
-        self.unlink(&mut *lim.waiters.lock());
-    }
-
-    /// Refill the worker and release core if appropriate.
-    unsafe fn refill_release(&mut self, core: &mut Core, lim: &RateLimiter) -> bool {
-        let mut waiters = lim.waiters.lock();
-
-        if self.refill(&mut waiters, lim.refill, lim) {
-            self.release(&mut *waiters, *core, lim);
-            return true;
-        }
-
-        false
-    }
-
-    /// Release the given number of tokens from the wait queue.
-    ///
-    /// Returns `true` if the current core has been completed and needs to be
-    /// released.
-    fn refill(
-        &mut self,
-        waiters: &mut MutexGuard<'_, LinkedList<Task>>,
-        refill: usize,
-        lim: &RateLimiter,
-    ) -> bool {
-        trace!(refill = refill, "refilling tokens");
-        let mut current = refill;
-
-        let mut bump = 0;
-
-        // Safety: we're holding the lock guard to all the waiters so we can be
-        // sure that we have exclusive access to the wait queue.
-        unsafe {
-            while current > 0 {
-                let mut node = match waiters.pop_back() {
-                    Some(node) => node,
-                    None => break,
-                };
-
-                let n = node.as_mut();
-                let before = n.remaining;
-                n.fill(&mut current);
-
-                trace! {
-                    current = current,
-                    before = before,
-                    remaining = n.remaining,
-                    "filled node",
-                };
-
-                if n.is_completed() {
-                    if let Some(complete) = n.complete {
-                        complete.as_ref().store(true, Ordering::Release);
-                    }
-
-                    if let Some(waker) = n.waker.take() {
-                        waker.wake();
-                    }
-                } else {
-                    waiters.push_back(node);
-                    break;
-                }
-
-                bump += 1;
-
-                if bump == BUMP_LIMIT {
-                    MutexGuard::bump(waiters);
-                    bump = 0;
-                }
-            }
-        }
-
-        if refill > 0 {
-            let mut old = lim.balance.load(Ordering::Relaxed);
-
-            loop {
-                let new = old.saturating_sub(refill);
-
-                match lim.balance.compare_exchange_weak(
-                    old,
-                    new,
-                    Ordering::SeqCst,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => break,
-                    Err(x) => old = x,
-                }
-            }
-        }
-
-        // If the limiter is not fair, we need to in addition to draining
-        // remaining tokens from linked nodes, drain it from ourselves.
-        if !lim.fair {
-            // We fill the current holder of the core last (self). To ensure
-            // that it stays around for as long as possible.
-            //
-            // Safety: we know that no one else holds the task at this point.
-            let c = self.task.get_mut();
-            c.fill(&mut current);
-            c.is_completed()
-        } else {
-            // We only need to check the state since the current core holder is
-            // linked up to the wait queue.
-            //
-            // Safety: we're doing this under the waiters lock so we know we
-            // have exclusive access to the node.
-            unsafe { (*self.task.get()).is_completed() }
-        }
-    }
-
-    /// Calculate and process the next core sleep.
-    fn next_sleep(&mut self, core: &mut Core, lim: &RateLimiter) -> Option<time::Duration> {
-        // Safety: we guard exclusive access to the core through the `available`
-        // field.
-        let last = core.last;
-
-        let now = time::Instant::now();
-        let d =
-            usize::try_from(now.saturating_duration_since(last).as_millis()).unwrap_or(usize::MAX);
-
-        if d <= lim.interval {
-            // We still have to wait for the remainder of an interval before we
-            // can fill up with more tokens.
-            return Some(time::Duration::from_millis(
-                u64::try_from(lim.interval - d).unwrap_or(u64::MAX),
-            ));
-        }
-
-        // it is appropriate to immediately add more permits.
-        let refill_periods = d / lim.interval;
-
-        let rem = time::Duration::from_millis(u64::try_from(d % lim.interval).unwrap_or(u64::MAX));
-
-        debug_assert! {
-            refill_periods > 0,
-            "refill periods should be larger than 0"
-        };
-
-        let refill = refill_periods.saturating_mul(lim.refill);
-
-        let mut waiters = lim.waiters.lock();
-
-        if !self.refill(&mut waiters, refill, lim) {
-            return Some(rem);
-        }
-
-        // We synthetically "ran" at the current time minus the remaining time
-        // we need to wait until the last update period.
-        core.last = now - rem;
-        self.release(&mut *waiters, *core, lim);
-        None
-    }
-
-    /// Release the current core. Beyond this point the current task may no
-    /// longer interact exclusively with the core.
-    fn release(&mut self, waiters: &mut LinkedList<Task>, core: Core, lim: &RateLimiter) {
-        // Hand the state of the core back.
-        //
-        // Safety: we're doing this right before we unset the available flag,
-        // ensuring that we do indeed have exclusive access to the state of the
-        // core.
-        unsafe {
-            *lim.core.get() = core;
-        }
-
-        // Marks the core as available for anyone else to steal.
-        lim.available.store(true, Ordering::Release);
-
-        // Find another task that might take over as core. Once it has acquired
-        // core status it will have to make sure it is no longer linked into the
-        // wait queue.
-        //
-        // We have to do this, because another task might miss that the core is
-        // available since it's hidden behind an atomic, so we wake any task up
-        // to ensure that it will always be picked up.
-        //
-        // Safety: We're holding the lock guard to all the waiters so we can be
-        // certain that we have exclusive access.
-        unsafe {
-            if let Some(mut node) = waiters.front_mut() {
-                if let Some(waker) = node.as_mut().waker.take() {
-                    waker.wake();
-                }
-            }
-        }
-    }
+    /// The node in the linked list.
+    task: Node<Task>,
+    /// If this node has been released or not. We make this an atomic to permit
+    /// access to it without synchronization.
+    complete: AtomicBool,
+    /// Avoids noalias heuristics from kicking in on references to a `Linking`
+    /// struct.
+    _pin: marker::PhantomPinned,
 }
 
 #[cfg(test)]
