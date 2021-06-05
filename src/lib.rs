@@ -199,6 +199,7 @@
 use parking_lot::{Mutex, MutexGuard};
 use std::cell::UnsafeCell;
 use std::convert::TryFrom as _;
+use std::fmt;
 use std::future::Future;
 use std::marker;
 use std::pin::Pin;
@@ -274,7 +275,7 @@ unsafe impl Sync for Task {}
 
 /// Core associated with the task that is currently responsible for driving the
 /// rate limiter.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct Core {
     /// Last time tokens were added.
     last: time::Instant,
@@ -754,8 +755,10 @@ impl AcquireState {
 
     /// Update the waiting state for this acquisition task. This might require
     /// that we update the associated waker.
+    #[tracing::instrument(skip(self, waiters, waker), level = "trace")]
     unsafe fn update(&mut self, waiters: &mut LinkedList<Task>, waker: &Waker) {
         if !self.linked {
+            trace!("linking self");
             self.linked = true;
             waiters.push_front(self.task_mut().into());
         }
@@ -772,23 +775,25 @@ impl AcquireState {
         };
 
         if new_waker {
+            trace!("updating waker");
             *w = Some(waker.clone());
         }
 
         if task.complete.is_none() {
+            trace!("setting complete");
             task.complete = Some(complete.into());
         }
     }
 
     // Ensure that the current core task is correctly linked up if needed.
-    unsafe fn core_link(&mut self, lim: &RateLimiter) {
+    #[tracing::instrument(skip(self, waiters, lim), level = "trace")]
+    unsafe fn core_link(&mut self, waiters: &mut LinkedList<Task>, lim: &RateLimiter) {
         if lim.fair {
             // Fair scheduling needs to ensure that the core is part
             // of the wait queue, and will be woken up in-order with
             // other tasks.
             if !self.linked {
                 self.linked = true;
-                let mut waiters = lim.waiters.lock();
                 waiters.push_front(self.task_mut().into());
             }
 
@@ -807,15 +812,15 @@ impl AcquireState {
         // Ensure that the current task is *not* linked since it is now to
         // become the coordinator for everyone else.
         self.linked = false;
-        let mut waiters = lim.waiters.lock();
         waiters.remove(self.task_mut().into());
     }
 
     /// Refill the worker and release core if appropriate.
+    #[tracing::instrument(skip(self, core, lim), level = "trace")]
     unsafe fn refill_release(&mut self, core: &mut Core, lim: &RateLimiter) -> bool {
         let mut waiters = lim.waiters.lock();
 
-        if self.refill(&mut waiters, lim.refill, lim) {
+        if self.exclusive_refill(&mut waiters, lim.refill, lim) {
             self.release(&mut *waiters, *core, lim);
             return true;
         }
@@ -827,12 +832,13 @@ impl AcquireState {
     ///
     /// Returns `true` if the current core has been completed and needs to be
     /// released.
+    #[tracing::instrument(skip(self, waiters, lim), level = "trace")]
     fn refill(
-        &mut self,
+        &self,
         waiters: &mut MutexGuard<'_, LinkedList<Task>>,
         refill: usize,
         lim: &RateLimiter,
-    ) -> bool {
+    ) -> usize {
         trace!(refill = refill, "refilling tokens");
         let mut current = refill;
 
@@ -885,6 +891,12 @@ impl AcquireState {
 
             loop {
                 let new = old.saturating_sub(refill);
+                trace!(
+                    old = old,
+                    new = new,
+                    current = current,
+                    "try updating balance"
+                );
 
                 match lim.balance.compare_exchange_weak(
                     old,
@@ -897,6 +909,19 @@ impl AcquireState {
                 }
             }
         }
+
+        current
+    }
+
+    /// Refill that occurse when the current core is exclusively held.
+    #[tracing::instrument(skip(self, waiters, refill, lim), level = "trace")]
+    fn exclusive_refill(
+        &mut self,
+        waiters: &mut MutexGuard<'_, LinkedList<Task>>,
+        refill: usize,
+        lim: &RateLimiter,
+    ) -> bool {
+        let mut current = self.refill(waiters, refill, lim);
 
         if lim.fair {
             // We only need to check the state since the current core holder is
@@ -921,8 +946,13 @@ impl AcquireState {
 
     /// Assume the current core and calculate how long we must sleep for in
     /// order to do it.
-    unsafe fn assume_core(&mut self, lim: &RateLimiter) -> Option<(Core, time::Duration)> {
-        self.core_link(lim);
+    #[tracing::instrument(skip(self, lim), level = "trace")]
+    unsafe fn assume_core(
+        &mut self,
+        waiters: &mut MutexGuard<'_, LinkedList<Task>>,
+        lim: &RateLimiter,
+    ) -> Option<(Core, time::Duration)> {
+        self.core_link(waiters, lim);
 
         let mut core = *lim.core.get();
 
@@ -955,22 +985,23 @@ impl AcquireState {
 
         let refill = refill_periods.saturating_mul(lim.refill);
 
-        let mut waiters = lim.waiters.lock();
-
-        if !self.refill(&mut waiters, refill, lim) {
+        if !self.exclusive_refill(waiters, refill, lim) {
             return Some((core, rem));
         }
 
         // We synthetically "ran" at the current time minus the remaining time
         // we need to wait until the last update period.
         core.last = now - rem;
-        self.release(&mut *waiters, core, lim);
+        self.release(waiters, core, lim);
         None
     }
 
     /// Release the current core. Beyond this point the current task may no
     /// longer interact exclusively with the core.
+    #[tracing::instrument(skip(self, waiters, lim), level = "trace")]
     fn release(&mut self, waiters: &mut LinkedList<Task>, core: Core, lim: &RateLimiter) {
+        trace!(core = ?core, "releasing core");
+
         // Hand the state of the core back.
         //
         // Safety: we're doing this right before we unset the available flag,
@@ -995,11 +1026,19 @@ impl AcquireState {
         // certain that we have exclusive access.
         unsafe {
             if let Some(mut node) = waiters.front_mut() {
+                trace!(node = ?node, "waking next core");
+
                 if let Some(waker) = node.as_mut().waker.take() {
                     waker.wake();
                 }
             }
         }
+    }
+}
+
+impl fmt::Debug for AcquireState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AcquireState").finish()
     }
 }
 
@@ -1168,12 +1207,6 @@ where
                     // the permits available from the current balance.
                     let old = lim.balance.fetch_add(this.permits, Ordering::AcqRel);
 
-                    // First token acquired, so record the timestamp at which it
-                    // was acquired so that interval calculations remain
-                    // accurate. We don't need to bother updating the timestamps
-                    // otherwise, because the rate limiter will remain under
-                    // contention at which point there will always be a core
-                    // around to do the interval work.
                     if old == 0 {
                         let flags = lim.flags.fetch_or(FLAG_FIRST, Ordering::AcqRel);
 
@@ -1185,34 +1218,35 @@ where
                         // If this doesn't hold it simply means that the core
                         // has already been assumed by some other process.
                         if flags == 0 || flags == FLAG_LOCK {
-                            trace!("updating last timestamp");
-
                             unsafe {
                                 (*lim.core.get()).last = time::Instant::now();
                             }
 
-                            let flags = if flags == FLAG_LOCK {
+                            let locked = if flags == FLAG_LOCK {
                                 // No need to modify flags since we know we have
                                 // exclusive access now.
-                                flags
+                                true
                             } else {
                                 // Try to unlock the core, if we raced with a
                                 // LOCK, we take over as core.
-                                lim.flags.fetch_and(!FLAG_FIRST, Ordering::AcqRel)
+                                lim.flags.fetch_and(!FLAG_FIRST, Ordering::AcqRel) & FLAG_LOCK != 0
                             };
 
-                            if flags == FLAG_LOCK {
+                            if locked {
                                 unsafe {
-                                    let (core, rem) = match this.internal.assume_core(lim) {
-                                        Some(output) => output,
-                                        None => {
-                                            // Marks as completed.
-                                            this.state = State::Complete;
-                                            return Poll::Ready(());
-                                        }
-                                    };
+                                    let mut waiters = lim.waiters.lock();
 
-                                    trace!(sleep = ?rem, "taking over core from timestamp and sleeping");
+                                    let (core, rem) =
+                                        match this.internal.assume_core(&mut waiters, lim) {
+                                            Some(output) => output,
+                                            None => {
+                                                // Marks as completed.
+                                                this.state = State::Complete;
+                                                return Poll::Ready(());
+                                            }
+                                        };
+
+                                    trace!(sleep = ?rem, "taking over core from last and sleeping");
                                     this.state = State::Core {
                                         core,
                                         sleep: time::sleep(rem),
@@ -1255,15 +1289,19 @@ where
 
                         let flags = lim.flags.fetch_or(FLAG_LOCK, Ordering::AcqRel);
 
-                        // Try to take over as core. If we're unsuccessful we just ensure
-                        // that we're linked into the wait queue.
+                        // Note: we need to operate under this lock to ensure
+                        // that the core acquired here (or elsewhere) observes
+                        // that the current task has been linked up.
+                        let mut waiters = lim.waiters.lock();
+
+                        // Try to take over as core. If we're unsuccessful we
+                        // just ensure that we're linked into the wait queue.
                         if flags != 0 {
-                            let mut waiters = lim.waiters.lock();
                             this.internal.update(&mut *waiters, cx.waker());
                             return Poll::Pending;
                         }
 
-                        let (core, rem) = match this.internal.assume_core(lim) {
+                        let (core, rem) = match this.internal.assume_core(&mut waiters, lim) {
                             Some(output) => output,
                             None => {
                                 // Marks as completed.

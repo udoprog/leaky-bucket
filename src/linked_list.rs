@@ -1,9 +1,11 @@
 //! An intrusive linked list of waiters.
 
 use std::cell::UnsafeCell;
+use std::fmt;
 use std::marker;
 use std::ops;
 use std::ptr;
+use tracing::trace;
 
 #[repr(C)]
 struct Pointers<T> {
@@ -162,6 +164,7 @@ impl<T> LinkedList<T> {
     /// assert_eq!(*a, 1);
     /// assert_eq!(*b, 2);
     /// ```
+    #[tracing::instrument(level = "trace")]
     pub unsafe fn push_front(&mut self, mut node: ptr::NonNull<Node<T>>) {
         debug_assert!(node.as_ref().next().is_none());
         debug_assert!(node.as_ref().prev().is_none());
@@ -217,7 +220,10 @@ impl<T> LinkedList<T> {
     /// assert_eq!(*a, 2);
     /// assert_eq!(*b, 1);
     /// ```
+    #[tracing::instrument(level = "trace")]
     pub unsafe fn push_back(&mut self, mut node: ptr::NonNull<Node<T>>) {
+        trace!(head = ?self.head, tail = ?self.tail, node = ?node, "push_back");
+
         debug_assert!(node.as_ref().next().is_none());
         debug_assert!(node.as_ref().prev().is_none());
 
@@ -259,7 +265,10 @@ impl<T> LinkedList<T> {
     /// assert_eq!(*a, 1);
     /// assert_eq!(*b, 2);
     /// ```
+    #[tracing::instrument(level = "trace")]
     pub unsafe fn pop_front(&mut self) -> Option<ptr::NonNull<Node<T>>> {
+        trace!(head = ?self.head, tail = ?self.tail, "pop_front");
+
         let mut head = self.head?;
 
         if let Some(mut next) = head.as_mut().take_next() {
@@ -305,7 +314,10 @@ impl<T> LinkedList<T> {
     /// assert_eq!(*a, 2);
     /// assert_eq!(*b, 1);
     /// ```
+    #[tracing::instrument(level = "trace")]
     pub unsafe fn pop_back(&mut self) -> Option<ptr::NonNull<Node<T>>> {
+        trace!(head = ?self.head, tail = ?self.tail, "pop_back");
+
         let mut tail = self.tail?;
 
         if let Some(mut prev) = tail.as_mut().take_prev() {
@@ -360,8 +372,9 @@ impl<T> LinkedList<T> {
     /// assert_eq!(*c, 1);
     /// assert_eq!(*d, 0);
     /// ```
+    #[tracing::instrument(level = "trace")]
     pub unsafe fn remove(&mut self, mut node: ptr::NonNull<Node<T>>) {
-        dbg!(self.head, self.tail, node);
+        trace!(head = ?self.head, tail = ?self.tail, node = ?node, "remove");
 
         let (next, prev) = node.as_mut().take_pair();
 
@@ -411,8 +424,18 @@ impl<T> LinkedList<T> {
     ///
     /// assert_eq!(*a, 1);
     /// ```
+    #[tracing::instrument(level = "trace")]
     pub unsafe fn front_mut(&mut self) -> Option<ptr::NonNull<Node<T>>> {
         self.head
+    }
+}
+
+impl<T> fmt::Debug for LinkedList<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LinkedList")
+            .field("head", &self.head)
+            .field("tail", &self.tail)
+            .finish()
     }
 }
 
