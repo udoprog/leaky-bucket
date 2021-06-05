@@ -1,37 +1,36 @@
-use leaky_bucket::LeakyBuckets;
+use leaky_bucket::RateLimiter;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time;
 
 /// Test that a bunch of threads spinning on a rate limiter refilling a
 /// reasonable amount of tokens at a slowish rate reaches the given target.
 #[tokio::test]
 async fn test_rate_limit_target() {
-    let mut buckets = LeakyBuckets::new();
-    let coordinator = buckets.coordinate().unwrap();
-    tokio::spawn(async move { coordinator.await.unwrap() });
+    const TARGET: usize = 500;
+    const INTERVALS: usize = 10;
+    const DURATION: u64 = 2000;
+    const TARGET_DIFFERENCE: u32 = 20;
 
-    let rate_limiter = buckets
-        .rate_limiter()
-        .refill_amount(50)
-        .refill_interval(Duration::from_millis(200))
-        .build()
-        .expect("LeakyBucket builder failed");
+    let limiter = RateLimiter::builder()
+        .refill(TARGET / INTERVALS)
+        .interval(time::Duration::from_millis(DURATION / INTERVALS as u64))
+        .build();
 
-    let rate_limiter = Arc::new(rate_limiter);
+    let limiter = Arc::new(limiter);
     let c = Arc::new(AtomicUsize::new(0));
 
-    let start = Instant::now();
+    let start = time::Instant::now();
 
     let mut tasks = Vec::new();
 
     for _ in 0..100 {
-        let rate_limiter = rate_limiter.clone();
+        let limiter = limiter.clone();
         let c = c.clone();
 
         tasks.push(tokio::spawn(async move {
-            while c.fetch_add(1, Ordering::SeqCst) < 500 {
-                rate_limiter.acquire_one().await.unwrap();
+            while c.fetch_add(1, Ordering::SeqCst) < TARGET {
+                limiter.acquire_one().await;
             }
         }));
     }
@@ -40,12 +39,14 @@ async fn test_rate_limit_target() {
         t.await.unwrap();
     }
 
-    let duration = Instant::now().duration_since(start);
+    let duration = time::Instant::now().duration_since(start);
 
-    let diff = duration.as_millis() as f32 - 2000f32;
-    assert!(
-        diff.abs() < 10f32,
-        "diff must be less than 10ms, but was {}ms",
-        diff
-    );
+    let diff = duration.as_millis() as f32 - DURATION as f32;
+
+    assert! {
+        diff.abs() < TARGET_DIFFERENCE as f32,
+        "diff must be less than {}ms, but was {}ms",
+        TARGET_DIFFERENCE,
+        diff,
+    };
 }

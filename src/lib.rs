@@ -6,771 +6,1310 @@
 //!
 //! A token-based rate limiter based on the [leaky bucket] algorithm.
 //!
-//! If the tokens are already available, the acquisition will be instant through
-//! a fast path, and the acquired number of tokens will be added to the bucket.
+//! If the bucket overflows and goes over its max configured capacity, the task
+//! that tried to acquire the tokens will be suspended until the required number
+//! of tokens has been drained from the bucket.
 //!
-//! If the bucket overflows (i.e. goes over max), the task that tried to acquire
-//! the tokens will be suspended until the required number of tokens has been
-//! added.
+//! Since this crate uses timing facilities from tokio it has to be used within
+//! a Tokio runtime with the [`time` feature] enabled.
 //!
 //! ## Usage
 //!
 //! Add the following to your `Cargo.toml`:
 //!
 //! ```toml
-//! leaky-bucket = "0.9.0"
+//! leaky-bucket = "0.11.0"
 //! ```
 //!
-//! ## Example
+//! ## Examples
 //!
-//! If the project is built with the `static` feature (default), you can use
-//! [LeakyBucket] directly as long as you are inside a Tokio runtime, like so:
+//! The core type is the [`RateLimiter`] type, which allows for limiting the
+//! throughput of a section using its [`acquire`] and [`acquire_one`] methods.
 //!
-//! ```no_run
-//! use leaky_bucket::LeakyBucket;
-//! use std::{error::Error, time::Duration};
+//! ```
+//! use leaky_bucket::RateLimiter;
+//! use std::time;
 //!
 //! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn Error>> {
-//!     let rate_limiter = LeakyBucket::builder()
-//!         .max(5)
-//!         .tokens(5)
-//!         .build()?;
+//! async fn main() {
+//!     let limiter = RateLimiter::builder()
+//!         .max(10)
+//!         .initial(0)
+//!         .refill(5)
+//!         .build();
+//!
+//!     let start = time::Instant::now();
 //!
 //!     println!("Waiting for permit...");
-//!     // should take about 5 seconds to acquire.
-//!     rate_limiter.acquire(10).await?;
-//!     println!("I made it!");
-//!     Ok(())
+//!
+//!     // Should take about 5 seconds to acquire in total.
+//!     let a = limiter.acquire(7);
+//!     let b = limiter.acquire(3);
+//!     let c = limiter.acquire(10);
+//!
+//!     let ((), (), ()) = tokio::join!(a, b, c);
+//!
+//!     println!(
+//!         "I made it in {:?}!",
+//!         time::Instant::now().duration_since(start)
+//!     );
 //! }
 //! ```
 //!
-//! Note that only one coordinator instance will be lazily created, and it's
-//! associated with the runtime from within it was constructed. To use multiple
-//! runtimes you must use an explicit coordinator as documented in the next
-//! section.
+//! ## Implementation details
 //!
-//! ## Example using explicit coordinator
+//! Each rate limiter has two acquisition modes. A fast path and a slow path.
+//! The fast path is used if the desired number of tokens are readily available,
+//! and involves incrementing an atomic counter indicating that the acquired
+//! number of tokens have been added to the bucket.
 //!
-//! Leaky buckets require coordination. By default, this will happen through a
-//! static coordinator spawned through [tokio::spawn] at first use. If you want
-//! to spawn the coordinator yourself, you can do the following with
-//! [LeakyBuckets]:
+//! If this counter goes over its configured maximum capacity, it overflows into
+//! a slow path. Here one of the acquiring tasks will switch over to work as a
+//! *core*. This is known as *core switching*.
 //!
-//! ```no_run
-//! use leaky_bucket::LeakyBuckets;
-//! use std::{error::Error, time::Duration};
+//! ```
+//! use leaky_bucket::RateLimiter;
+//! use std::time;
 //!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn Error>> {
-//!     let mut buckets = LeakyBuckets::new();
-//!     let coordinator = buckets.coordinate()?;
+//! # #[tokio::main] async fn main() {
+//! let limiter = RateLimiter::builder()
+//!     .initial(10)
+//!     .interval(time::Duration::from_millis(100))
+//!     .build();
 //!
-//!     // spawn the coordinate thread to refill the rate limiter.
-//!     tokio::spawn(async move { coordinator.await.expect("coordinator errored") });
+//! // This is instantaneous since the rate limiter starts with 10 tokens to
+//! // spare.
+//! limiter.acquire(10).await;
 //!
-//!     let rate_limiter = buckets
-//!         .rate_limiter()
-//!         .max(5)
-//!         .tokens(5)
-//!         .build()?;
-//!
-//!     println!("Waiting for permit...");
-//!     // should take about 5 seconds to acquire.
-//!     rate_limiter.acquire(10).await?;
-//!     println!("I made it!");
-//!     Ok(())
-//! }
+//! // This however needs to core switch and wait for a while until the desired
+//! // number of tokens is available.
+//! limiter.acquire(3).await;
+//! # }
 //! ```
 //!
-//! Note that since this coordinator uses timing facilities from tokio it has to
-//! be spawned within a Tokio runtime with the [`time` feature] enabled.
+//! The core is responsible for sleeping for the configured interval so that
+//! more tokens can be added. After which it ensures that any tasks that are
+//! waiting to acquire including itself are appropriately unsuspended.
 //!
+//! On-demand core switching is what allows this rate limiter implementation to
+//! work without a coordinating background thread. But we need to ensure that
+//! any asynchronous tasks that uses [`RateLimiter`] must either run an
+//! [`acquire`] call to completion, or be *cancelled* by being dropped.
+//!
+//! If none of these hold, the core might leak and be locked indefinitely
+//! preventing any future use of the rate limiter from making progress. This is
+//! similar to if you would lock an asynchronous [`Mutex`] but never drop its
+//! guard.
+//!
+//! > You can run this example with:
+//! >
+//! > ```sh
+//! > cargo run --example block-forever
+//! > ```
+//!
+//! ```
+//! use leaky_bucket::RateLimiter;
+//! use std::future::Future;
+//! use std::sync::Arc;
+//! use std::task::Context;
+//!
+//! struct Waker;
+//! # impl std::task::Wake for Waker { fn wake(self: Arc<Self>) { } }
+//!
+//! # #[tokio::main] async fn main() {
+//! let limiter = Arc::new(RateLimiter::builder().build());
+//!
+//! let waker = Arc::new(Waker).into();
+//! let mut cx = Context::from_waker(&waker);
+//!
+//! let mut a0 = Box::pin(limiter.acquire(1));
+//! // Poll once to ensure that the core task is assigned.
+//! assert!(a0.as_mut().poll(&mut cx).is_pending());
+//! assert!(a0.is_core());
+//!
+//! // We leak the core task, preventing the rate limiter from making progress
+//! // by assigning new core tasks.
+//! std::mem::forget(a0);
+//!
+//! // Awaiting acquire here would block forever.
+//! // limiter.acquire(1).await;
+//! # }
+//! ```
+//!
+//! ## Fairness
+//!
+//! By default [`RateLimiter`] uses a *fair* scheduler. This ensures that the
+//! core task makes progress even if there are many tasks waiting to acquire
+//! tokens. As a result it causes more frequent core switching, increasing the
+//! total work needed. An unfair scheduler is expected to do a bit less work
+//! under contention. But without fair scheduling some tasks might end up taking
+//! longer to acquire than expected.
+//!
+//! This behavior can be changed tweaked the [`Builder::fair`] option.
+//!
+//! ```
+//! use leaky_bucket::RateLimiter;
+//!
+//! let limiter = RateLimiter::builder()
+//!     .fair(false)
+//!     .build();
+//! ```
+//!
+//! The `unfair-scheduling` example can showcase this phenomenon.
+//!
+//! ```sh
+//! cargh run --example unfair-scheduling
+//! ```
+//!
+//! ```text
+//! # fair
+//! Max: 1011ms, Total: 1012ms
+//! Timings:
+//!  0: 101ms
+//!  1: 101ms
+//!  2: 101ms
+//!  3: 101ms
+//!  4: 101ms
+//!  ...
+//! # unfair
+//! Max: 1014ms, Total: 1014ms
+//! Timings:
+//!  0: 1014ms
+//!  1: 101ms
+//!  2: 101ms
+//!  3: 101ms
+//!  4: 101ms
+//!  ...
+//! ```
+//!
+//! As can be seen above the first task in the *unfair* scheduler takes longer
+//! to run because it prioritises releasing other tasks waiting to acquire over
+//! itself.
+//!
+//! [`acquire_one`]: https://docs.rs/leaky-bucket/0/leaky_bucket/struct.RateLimiter.html#method.acquire_one
+//! [`acquire`]: https://docs.rs/leaky-bucket/0/leaky_bucket/struct.RateLimiter.html#method.acquire
+//! [`Builder::fair`]: https://docs.rs/leaky-bucket/0/leaky_bucket/struct.Builder.html#method.fair
+//! [`Mutex`]: https://docs.rs/tokio/1/tokio/sync/struct.Mutex.html
+//! [`RateLimiter`]: https://docs.rs/leaky-bucket/0/leaky_bucket/struct.RateLimiter.html
+//! [`time` feature]: https://docs.rs/tokio/1/tokio/#feature-flags
 //! [leaky bucket]: https://en.wikipedia.org/wiki/Leaky_bucket
-//! [tokio::spawn]: https://docs.rs/tokio/0/tokio/fn.spawn.html
-//! [LeakyBucket]: https://docs.rs/leaky-bucket/0/leaky_bucket/struct.LeakyBucket.html
-//! [LeakyBuckets]: https://docs.rs/leaky-bucket/0/leaky_bucket/struct.LeakyBuckets.html
-//! [`time` feature]: https://docs.rs/tokio/0.2.22/tokio/#feature-flags
 
-use futures_util::stream::FuturesUnordered;
-use std::collections::VecDeque;
+#![deny(missing_docs, missing_doc_code_examples)]
+
+use parking_lot::{Mutex, MutexGuard};
+use std::cell::UnsafeCell;
+use std::convert::TryFrom as _;
 use std::future::Future;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::marker;
+use std::pin::Pin;
+use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-use thiserror::Error;
-use tokio::sync::{mpsc, oneshot};
-use tokio_stream::StreamExt as _;
+use std::task::{Context, Poll, Waker};
+use tokio::time;
+use tracing::trace;
 
-#[cfg(feature = "static")]
-lazy_static::lazy_static! {
-    static ref LEAKY_BUCKETS: LeakyBuckets = {
-        let mut buckets = LeakyBuckets::new();
-        let coordinator = buckets.coordinate().expect("no other running coordinator");
-        tokio::spawn(async move { coordinator.await.expect("coordinate thread errored") });
-        buckets
-    };
+#[doc(hidden)]
+pub mod linked_list;
+use self::linked_list::{LinkedList, Node};
+
+/// Default factor for how to calculate max refill value.
+const DEFAULT_REFILL_MAX_FACTOR: usize = 10;
+
+/// Interval to bump the shared mutex guard to allow other parts of the system
+/// to make process. Processes which loop should use this number to determine
+/// how many times it should loop before calling [MutexGuard::bump].
+///
+/// If we do not respect this limit we might inadvertently end up starving other
+/// tasks from making progress so that they can unblock.
+const BUMP_LIMIT: usize = 16;
+
+/// Linked task state.
+struct Task {
+    /// Remaining tokens that need to be satisfied.
+    remaining: usize,
+    /// If this node has been released or not. We make this an atomic to permit
+    /// access to it without synchronization and a raw pointer to ensure that we
+    /// don't violate unique aliasing associating with constructing mutable
+    /// references.
+    complete: Option<ptr::NonNull<AtomicBool>>,
+    /// The waker associated with the node.
+    waker: Option<Waker>,
 }
 
-/// Error type for the rate limiter.
-#[derive(Debug, Error)]
-#[non_exhaustive]
-pub enum Error {
-    /// The bucket has already been started.
-    #[error("Coordinator already started")]
-    AlreadyStarted,
-    /// There was an issue enqueueing a task.
-    #[error("Failed to send task to coordinator")]
-    TaskSendError,
-    /// Issue when waiting for task coordinator to wake an acquire up.
-    #[error("Failed to wait for task coordinator")]
-    TaskWaitError,
-    /// Failed to queue up new task.
-    #[error("Failed to queue up new task coordinator")]
-    NewTaskError,
-    /// Tried to acquire more tokens than what is possible.
-    #[error("Acquiring tokens would cause an overflow")]
-    TokenOverflow,
-}
-
-struct NewTask {
-    inner: Arc<Inner>,
-    task_rx: mpsc::Receiver<Task>,
-}
-
-struct LeakyBucketsInner {
-    new_task_tx: mpsc::UnboundedSender<NewTask>,
-}
-
-/// Coordinator for rate limiters. Is used to create new rate limiters as needed.
-pub struct LeakyBuckets {
-    inner: Arc<LeakyBucketsInner>,
-    new_task_rx: Option<mpsc::UnboundedReceiver<NewTask>>,
-}
-
-impl Default for LeakyBuckets {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl LeakyBuckets {
-    /// Construct a new coordinator for rate limiters.
-    pub fn new() -> Self {
-        let (new_task_tx, new_task_rx) = mpsc::unbounded_channel();
-        let inner = Arc::new(LeakyBucketsInner { new_task_tx });
-
-        LeakyBuckets {
-            inner,
-            new_task_rx: Some(new_task_rx),
+impl Task {
+    /// Construct a new task state with the given permits remaining.
+    const fn new() -> Self {
+        Self {
+            remaining: 0,
+            complete: None,
+            waker: None,
         }
     }
 
-    /// Run the coordinator.
+    /// Test if the current node is completed.
+    fn is_completed(&self) -> bool {
+        self.remaining == 0
+    }
+
+    /// Fill the current node from the given pool of tokens and modify it.
+    fn fill(&mut self, current: &mut usize) {
+        let removed = usize::min(self.remaining, *current);
+        self.remaining -= removed;
+        *current -= removed;
+    }
+}
+
+// Safety: Task state must be carefully synchronized. But it is internal to
+// this module.
+unsafe impl Send for Task {}
+unsafe impl Sync for Task {}
+
+/// Core associated with the task that is currently responsible for driving the
+/// rate limiter.
+#[derive(Clone, Copy)]
+struct Core {
+    /// Last time tokens were added.
+    last: time::Instant,
+}
+
+/// A borrowed rate limiter.
+struct BorrowedRateLimiter<'a>(&'a RateLimiter);
+
+impl AsRef<RateLimiter> for BorrowedRateLimiter<'_> {
+    fn as_ref(&self) -> &RateLimiter {
+        self.0
+    }
+}
+
+/// A token-bucket rate limiter.
+pub struct RateLimiter {
+    /// Current balance of tokens. A value of 0 means that it is empty. Goes up
+    /// to [`RateLimiter::max`].
+    balance: AtomicUsize,
+    /// Tokens to add every `per` duration.
+    refill: usize,
+    /// Interval in milliseconds to add tokens.
+    interval: usize,
+    /// Max number of tokens associated with the rate limiter.
+    max: usize,
+    /// If the rate limiter is fair or not.
+    fair: bool,
+    /// Shared state of the rate limiter.
+    waiters: Mutex<LinkedList<Task>>,
+    /// The core is owned by someone.
+    available: AtomicBool,
+    /// The current rate limiter core. This is exclusively used by the first
+    /// task that blocks due to rate limiting and migrates from task to task.
+    /// Access to the core is guarded by the `available` field.
+    core: UnsafeCell<Core>,
+}
+
+impl RateLimiter {
+    /// Construct a new [`Builder`] for a [`RateLimiter`].
     ///
     /// # Examples
     ///
-    /// ```rust,no_run
-    /// use leaky_bucket::LeakyBuckets;
-    /// use std::{error::Error, time::Duration};
+    /// ```
+    /// use leaky_bucket::RateLimiter;
+    /// use std::time::Duration;
     ///
-    /// # #[tokio::main]
-    /// # async fn main() -> Result<(), Box<dyn Error>> {
-    /// let mut buckets = LeakyBuckets::new();
-    /// let coordinator = buckets.coordinate()?;
+    /// let limiter = RateLimiter::builder()
+    ///     .initial(100)
+    ///     .refill(100)
+    ///     .max(1000)
+    ///     .interval(Duration::from_millis(250))
+    ///     .fair(false)
+    ///     .build();
+    /// ```
+    pub fn builder() -> Builder {
+        Builder::default()
+    }
+
+    /// Get the current token balance.
     ///
-    /// // spawn the coordinate thread to refill the rate limiter.
-    /// tokio::spawn(async move { coordinator.await.expect("coordinator errored") });
-    /// # Ok(())
+    /// This indicates how many tokens can be requested without blocking.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use leaky_bucket::RateLimiter;
+    ///
+    /// # #[tokio::main] async fn main() {
+    /// let limiter = RateLimiter::builder()
+    ///     .initial(100)
+    ///     .build();
+    ///
+    /// assert_eq!(limiter.balance(), 100);
+    /// limiter.acquire(10).await;
+    /// assert_eq!(limiter.balance(), 90);
     /// # }
     /// ```
-    pub fn coordinate(
-        &mut self,
-    ) -> Result<impl Future<Output = Result<(), Error>> + 'static, Error> {
-        let mut new_task_rx = match self.new_task_rx.take() {
-            Some(new_task_rx) => new_task_rx,
-            None => return Err(Error::AlreadyStarted),
-        };
-
-        Ok(async move {
-            let mut futures = FuturesUnordered::new();
-            let mut new_task_ended = false;
-
-            while !futures.is_empty() || !new_task_ended {
-                tokio::select! {
-                    new_task = new_task_rx.recv(), if !new_task_ended => {
-                        let NewTask { inner, task_rx } = match new_task {
-                            Some(new_task) => new_task,
-                            None => {
-                                new_task_ended = true;
-                                continue;
-                            }
-                        };
-
-                        futures.push(inner.coordinate(task_rx));
-                    }
-                    result = futures.next(), if !futures.is_empty() => {
-                        // NB: this should never happen, since we check that the
-                        // stream is non-empty.
-                        let result = result.expect("worker queue ended");
-                        result?;
-                    }
-                }
-            }
-
-            Ok(())
-        })
+    pub fn balance(&self) -> usize {
+        let balance = self.balance.load(Ordering::Acquire);
+        self.max.saturating_sub(balance)
     }
 
-    /// Construct a new rate limiter.
-    pub fn rate_limiter(&self) -> Builder<'_> {
-        Builder {
-            new_task_tx: &self.inner.new_task_tx,
-            tokens: None,
-            max: None,
-            refill_interval: None,
-            refill_amount: None,
-        }
+    /// Acquire a single permit.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use leaky_bucket::RateLimiter;
+    ///
+    /// # #[tokio::main] async fn main() {
+    /// let limiter = RateLimiter::builder()
+    ///     .initial(10)
+    ///     .build();
+    ///
+    /// limiter.acquire_one().await;
+    /// # }
+    /// ```
+    pub fn acquire_one(&self) -> Acquire<'_> {
+        self.acquire(1)
+    }
+
+    /// Acquire the given number of permits, suspending the current task until
+    /// they are available.
+    ///
+    /// If zero permits are specified, this function never suspends the current
+    /// task.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use leaky_bucket::RateLimiter;
+    ///
+    /// # #[tokio::main] async fn main() {
+    /// let limiter = RateLimiter::builder()
+    ///     .initial(10)
+    ///     .build();
+    ///
+    /// limiter.acquire(10).await;
+    /// # }
+    /// ```
+    pub fn acquire(&self, permits: usize) -> Acquire<'_> {
+        Acquire(AcquireFut::new(BorrowedRateLimiter(self), permits))
+    }
+
+    /// Acquire a permit using an owned future.
+    ///
+    /// If zero permits are specified, this function never suspends the current
+    /// task.
+    ///
+    /// This required the [`RateLimiter`] to be wrapped inside of an
+    /// [`std::sync::Arc`] but will in contrast permit the acquire operation to
+    /// be owned by another struct making it more suitable for embedding.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use leaky_bucket::RateLimiter;
+    /// use std::sync::Arc;
+    ///
+    /// # #[tokio::main] async fn main() {
+    /// let limiter = Arc::new(RateLimiter::builder().initial(10).build());
+    ///
+    /// limiter.acquire_owned(10).await;
+    /// # }
+    /// ```
+    ///
+    /// Example when embedded into another future. This wouldn't be possible
+    /// with [`RateLimiter::acquire`] since it would otherwise hold a reference
+    /// to the corresponding [`RateLimiter`] instance.
+    ///
+    /// ```
+    /// use leaky_bucket::{RateLimiter, AcquireOwned};
+    /// use pin_project::pin_project;
+    /// use std::future::Future;
+    /// use std::pin::Pin;
+    /// use std::sync::Arc;
+    /// use std::task::{Context, Poll};
+    /// use std::time::Duration;
+    ///
+    /// #[pin_project]
+    /// struct MyFuture {
+    ///     limiter: Arc<RateLimiter>,
+    ///     #[pin]
+    ///     acquire: Option<AcquireOwned>,
+    /// }
+    ///
+    /// impl Future for MyFuture {
+    ///     type Output = ();
+    ///
+    ///     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    ///         let mut this = self.project();
+    ///
+    ///         loop {
+    ///             if let Some(acquire) = this.acquire.as_mut().as_pin_mut() {
+    ///                 futures::ready!(acquire.poll(cx));
+    ///                 return Poll::Ready(());
+    ///             }
+    ///
+    ///             this.acquire.set(Some(this.limiter.clone().acquire_owned(100)));
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// # #[tokio::main] async fn main() {
+    /// let limiter = Arc::new(RateLimiter::builder().initial(100).build());
+    ///
+    /// let future = MyFuture { limiter, acquire: None };
+    /// future.await;
+    /// # }
+    /// ```
+    pub fn acquire_owned(self: Arc<Self>, permits: usize) -> AcquireOwned {
+        AcquireOwned(AcquireFut::new(self, permits))
     }
 }
 
-/// Builder for a leaky bucket.
-pub struct Builder<'a> {
-    new_task_tx: &'a mpsc::UnboundedSender<NewTask>,
-    tokens: Option<usize>,
+// Safety: All the internals of acquire is thread safe and correctly
+// synchronized. The embedded waiter queue doesn't have anything inherently
+// unsafe in it.
+unsafe impl Send for RateLimiter {}
+unsafe impl Sync for RateLimiter {}
+
+/// A builder for a [`RateLimiter`].
+pub struct Builder {
+    /// The max number of tokens.
     max: Option<usize>,
-    refill_interval: Option<Duration>,
-    refill_amount: Option<usize>,
+    /// The initial count of tokens.
+    initial: usize,
+    /// Tokens to add every `per` duration.
+    refill: usize,
+    /// Interval to add tokens in milliseconds.
+    interval: usize,
+    /// If the rate limiter is fair or not.
+    fair: bool,
 }
 
-impl Builder<'_> {
-    /// Set the max value for the builder.
-    #[inline(always)]
-    pub fn max(mut self, max: usize) -> Self {
+impl Builder {
+    /// Configure the max number of tokens to use.
+    ///
+    /// If unspecified, this will default to be 2 times the [`refill`] or the
+    /// [`initial`] value, whichever is largest.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use leaky_bucket::RateLimiter;
+    ///
+    /// let limiter = RateLimiter::builder()
+    ///     .max(10_000)
+    ///     .build();
+    /// ```
+    ///
+    /// [`refill`]: Builder::refill
+    /// [`initial`]: Builder::initial
+    pub fn max(&mut self, max: usize) -> &mut Self {
         self.max = Some(max);
         self
     }
 
-    /// The number of tokens that the bucket should start with.
+    /// Configure the initial number of tokens to configure. The default value
+    /// is `0`.
     ///
-    /// If set to larger than `max` at build time, will only saturate to max.
-    #[inline(always)]
-    pub fn tokens(mut self, tokens: usize) -> Self {
-        self.tokens = Some(tokens);
+    /// # Examples
+    ///
+    /// ```
+    /// use leaky_bucket::RateLimiter;
+    ///
+    /// let limiter = RateLimiter::builder()
+    ///     .initial(10)
+    ///     .build();
+    /// ```
+    pub fn initial(&mut self, initial: usize) -> &mut Self {
+        self.initial = initial;
         self
     }
 
-    /// Set the max value for the builder.
-    #[inline(always)]
-    pub fn refill_interval(mut self, refill_interval: Duration) -> Self {
-        self.refill_interval = Some(refill_interval);
+    /// Configure the time duration between which we add [`refill`] number to
+    /// the bucket rate limiter.
+    ///
+    /// # Panics
+    ///
+    /// This panics if the provided interval does not fit within the millisecond
+    /// bounds of a [usize] or is zero.
+    ///
+    /// ```should_panic
+    /// use leaky_bucket::RateLimiter;
+    /// use std::time;
+    ///
+    /// let limiter = RateLimiter::builder()
+    ///     .interval(time::Duration::from_secs(u64::MAX))
+    ///     .build();
+    /// ```
+    ///
+    /// ```should_panic
+    /// use leaky_bucket::RateLimiter;
+    /// use std::time;
+    ///
+    /// let limiter = RateLimiter::builder()
+    ///     .interval(time::Duration::from_millis(0))
+    ///     .build();
+    /// ```
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use leaky_bucket::RateLimiter;
+    /// use std::time;
+    ///
+    /// let limiter = RateLimiter::builder()
+    ///     .interval(time::Duration::from_millis(100))
+    ///     .build();
+    /// ```
+    ///
+    /// [`refill`]: Builder::refill
+    pub fn interval(&mut self, interval: time::Duration) -> &mut Self {
+        let interval = usize::try_from(interval.as_millis())
+            .expect("refill interval out of millisecond bounds");
+        assert!(interval > 0, "interval must not be zero");
+
+        self.interval = interval;
         self
     }
 
-    /// Set the refill amount to use.
-    #[inline(always)]
-    pub fn refill_amount(mut self, refill_amount: usize) -> Self {
-        self.refill_amount = Some(refill_amount);
+    /// The number of tokens to add at each [`interval`] interval. The default
+    /// value is `1`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a refill amount of `0` is specified.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use leaky_bucket::RateLimiter;
+    /// use std::time;
+    ///
+    /// let limiter = RateLimiter::builder()
+    ///     .refill(100)
+    ///     .build();
+    /// ```
+    ///
+    /// [`interval`]: Builder::interval
+    pub fn refill(&mut self, refill: usize) -> &mut Self {
+        assert!(refill > 0, "refill amount cannot be zero");
+        self.refill = refill;
         self
     }
 
-    /// Construct a new leaky bucket.
-    pub fn build(self) -> Result<LeakyBucket, Error> {
-        const DEFAULT_MAX: usize = 120;
-        const DEFAULT_TOKENS: usize = 0;
-        const DEFAULT_REFILL_INTERVAL: Duration = Duration::from_secs(1);
-        const DEFAULT_REFILL_AMOUNT: usize = 1;
+    /// Configure the rate limiter to be fair. By default the rate limiter is
+    /// *fair* which ensures that all tasks make steady progress even under
+    /// contention. But an unfair scheduler might have a higher total
+    /// throughput.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use leaky_bucket::RateLimiter;
+    ///
+    /// let limiter = RateLimiter::builder()
+    ///     .refill(100)
+    ///     .fair(false)
+    ///     .build();
+    /// ```
+    pub fn fair(&mut self, fair: bool) -> &mut Self {
+        self.fair = fair;
+        self
+    }
 
-        let max = self.max.unwrap_or(DEFAULT_MAX);
-        let tokens = max.saturating_sub(self.tokens.unwrap_or(DEFAULT_TOKENS));
-        let refill_interval = self.refill_interval.unwrap_or(DEFAULT_REFILL_INTERVAL);
-        let refill_amount = self.refill_amount.unwrap_or(DEFAULT_REFILL_AMOUNT);
+    /// Construct a new [`RateLimiter`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use leaky_bucket::RateLimiter;
+    /// use std::time;
+    ///
+    /// let limiter = RateLimiter::builder()
+    ///     .refill(100)
+    ///     .interval(time::Duration::from_millis(200))
+    ///     .max(10_000)
+    ///     .build();
+    /// ```
+    pub fn build(&self) -> RateLimiter {
+        let core = Core {
+            last: time::Instant::now(),
+        };
 
-        let tokens = AtomicUsize::new(tokens);
+        let max = match self.max {
+            Some(max) => max,
+            None => usize::max(self.refill, self.initial).saturating_mul(DEFAULT_REFILL_MAX_FACTOR),
+        };
 
-        let (task_tx, task_rx) = mpsc::channel(1);
+        let initial = max.saturating_sub(self.initial);
 
-        let inner = Arc::new(Inner {
-            tokens,
+        RateLimiter {
+            balance: AtomicUsize::new(initial),
+            refill: self.refill,
+            interval: self.interval,
             max,
-            refill_interval,
-            refill_amount,
-        });
-
-        self.new_task_tx
-            .clone()
-            .send(NewTask {
-                inner: inner.clone(),
-                task_rx,
-            })
-            .map_err(|_| Error::NewTaskError)?;
-
-        Ok(LeakyBucket { inner, task_tx })
+            fair: self.fair,
+            waiters: Mutex::new(LinkedList::new()),
+            available: AtomicBool::new(true),
+            core: UnsafeCell::new(core),
+        }
     }
 }
 
-/// A single queued task waiting to be woken up.
-struct Task {
-    /// Amount required to wake up the given task.
-    required: usize,
-    /// Oneshot to trigger when the task completes.
-    completion: oneshot::Sender<()>,
-}
-
-struct Inner {
-    /// Current number of tokens that have been acquired.
-    ///
-    /// This has an inverted relationship to `max`.
-    /// The current number of active tokens can be found be subtracting the
-    /// the number of acquire tokens (this), from max.
-    ///
-    /// It is structure like this since adding to an atomic growing number to
-    /// acquire tokens is much easier than trying to subtract and truncate it
-    /// towards zero.
-    ///
-    /// This means that there is a risk the value will overflow.
-    tokens: AtomicUsize,
-    /// Max number of tokens.
-    max: usize,
-    /// Period to use when refilling.
-    refill_interval: Duration,
-    /// Amount to add when refilling.
-    refill_amount: usize,
-}
-
-impl std::fmt::Debug for Inner {
-    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        fmt.debug_struct("LeakyBucket")
-            .field("tokens", &self.tokens.load(Ordering::SeqCst))
-            .field("max", &self.max)
-            .field("refill_interval", &self.refill_interval)
-            .field("refill_amount", &self.refill_amount)
-            .finish()
+/// Construct a new builder with default options.
+///
+/// # Examples
+///
+/// ```
+/// use leaky_bucket::Builder;
+///
+/// let limiter = Builder::default().build();
+/// ```
+impl Default for Builder {
+    fn default() -> Self {
+        Self {
+            max: None,
+            initial: 0,
+            refill: 1,
+            interval: 100,
+            fair: true,
+        }
     }
 }
 
-impl Inner {
-    /// Coordinate tasks.
-    async fn coordinate(self: Arc<Inner>, mut task_rx: mpsc::Receiver<Task>) -> Result<(), Error> {
-        use std::mem;
+/// The state of an acquire operation.
+enum State {
+    /// Initial unconfigured state.
+    Initial,
+    /// The acquire is waiting to be released by the core.
+    Waiting,
+    /// This operation is currently the core.
+    ///
+    /// We need to take care to ensure that we don't move the configured sleep.
+    /// Since it needs to be pinned to be polled.
+    Core {
+        /// The state of the core.
+        core: Core,
+        /// The current sleep of the core.
+        sleep: time::Sleep,
+    },
+    /// The operation is completed.
+    Complete,
+}
 
-        let first = std::time::Instant::now()
-            .checked_add(self.refill_interval)
-            .unwrap_or_else(std::time::Instant::now);
+/// Internal state of the acquire. This is separated because it can be computed
+/// in constant time.
+struct AcquireState {
+    /// State of the acquisition.
+    state: State,
+    /// The linked up flag indicating if this task is completed or not.
+    complete: AtomicBool,
+    /// Inner state of the acquire.
+    linking: Linking,
+    /// Acquire internals is self-referential and most definitely !Unpin.
+    _marker: marker::PhantomPinned,
+}
 
-        // The interval at which we refill tokens.
-        let mut interval = tokio::time::interval_at(first.into(), self.refill_interval);
+impl AcquireState {
+    const INITIAL: AcquireState = AcquireState {
+        state: State::Initial,
+        complete: AtomicBool::new(false),
+        linking: Linking {
+            linked: false,
+            task: UnsafeCell::new(Node::new(Task::new())),
+        },
+        _marker: marker::PhantomPinned,
+    };
+}
 
-        // The current number of tokens accumulated locally.
-        // This will increase until we have enough to satisfy the next waking task.
-        let mut amount = 0usize;
-        let mut queue = VecDeque::new();
+/// The future associated with acquiring permits from a rate limiter using
+/// [`RateLimiter::acquire`].
+pub struct Acquire<'a>(AcquireFut<BorrowedRateLimiter<'a>>);
 
-        let mut task_rx_ended = false;
+impl Acquire<'_> {
+    /// Test if this acquire task is currently coordinating the rate limiter.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use leaky_bucket::RateLimiter;
+    /// use std::future::Future;
+    /// use std::sync::Arc;
+    /// use std::task::Context;
+    ///
+    /// struct Waker;
+    /// # impl std::task::Wake for Waker { fn wake(self: Arc<Self>) { } }
+    ///
+    /// # #[tokio::main] async fn main() {
+    /// let limiter = RateLimiter::builder().build();
+    ///
+    /// let waker = Arc::new(Waker).into();
+    /// let mut cx = Context::from_waker(&waker);
+    ///
+    /// let a1 = limiter.acquire(1);
+    /// tokio::pin!(a1);
+    ///
+    /// assert!(!a1.is_core());
+    /// assert!(a1.as_mut().poll(&mut cx).is_pending());
+    /// assert!(a1.is_core());
+    ///
+    /// a1.as_mut().await;
+    ///
+    /// // After completion this is no longer a core.
+    /// assert!(!a1.is_core());
+    /// # }
+    /// ```
+    pub fn is_core(&self) -> bool {
+        self.0.is_core()
+    }
+}
 
-        'outer: while !task_rx_ended || !queue.is_empty() {
-            tokio::select! {
-                task = task_rx.recv(), if !task_rx_ended => {
-                    if let Some(task) = task {
-                        queue.push_back(task);
-                    } else {
-                        task_rx_ended = true;
+impl Future for Acquire<'_> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let inner = unsafe { Pin::map_unchecked_mut(self, |this| &mut this.0) };
+        inner.poll(cx)
+    }
+}
+
+/// The future associated with acquiring permits from a rate limiter using
+/// [`RateLimiter::acquire_owned`].
+pub struct AcquireOwned(AcquireFut<Arc<RateLimiter>>);
+
+impl AcquireOwned {
+    /// Test if this acquire task is currently coordinating the rate limiter.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use leaky_bucket::RateLimiter;
+    /// use std::future::Future;
+    /// use std::sync::Arc;
+    /// use std::task::Context;
+    ///
+    /// struct Waker;
+    /// # impl std::task::Wake for Waker { fn wake(self: Arc<Self>) { } }
+    ///
+    /// # #[tokio::main] async fn main() {
+    /// let limiter = Arc::new(RateLimiter::builder().build());
+    ///
+    /// let waker = Arc::new(Waker).into();
+    /// let mut cx = Context::from_waker(&waker);
+    ///
+    /// let a1 = limiter.acquire_owned(1);
+    /// tokio::pin!(a1);
+    ///
+    /// assert!(!a1.is_core());
+    /// assert!(a1.as_mut().poll(&mut cx).is_pending());
+    /// assert!(a1.is_core());
+    ///
+    /// a1.as_mut().await;
+    ///
+    /// // After completion this is no longer a core.
+    /// assert!(!a1.is_core());
+    /// # }
+    /// ```
+    pub fn is_core(&self) -> bool {
+        self.0.is_core()
+    }
+}
+
+impl Future for AcquireOwned {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let inner = unsafe { Pin::map_unchecked_mut(self, |this| &mut this.0) };
+        inner.poll(cx)
+    }
+}
+
+struct AcquireFut<T>
+where
+    T: AsRef<RateLimiter>,
+{
+    /// Inner shared state.
+    lim: T,
+    permits: usize,
+    internal: AcquireState,
+}
+
+impl<T> AcquireFut<T>
+where
+    T: AsRef<RateLimiter>,
+{
+    #[inline]
+    fn new(lim: T, permits: usize) -> Self {
+        Self {
+            lim,
+            permits,
+            internal: AcquireState::INITIAL,
+        }
+    }
+
+    fn is_core(&self) -> bool {
+        matches!(&self.internal.state, State::Core { .. })
+    }
+}
+
+// Safety: All the internals of acquire is thread safe and correctly
+// synchronized. The embedded waiter queue doesn't have anything inherently
+// unsafe in it.
+unsafe impl<T> Send for AcquireFut<T> where T: AsRef<RateLimiter> {}
+unsafe impl<T> Sync for AcquireFut<T> where T: AsRef<RateLimiter> {}
+
+impl<T> Future for AcquireFut<T>
+where
+    T: AsRef<RateLimiter>,
+{
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = unsafe { self.get_unchecked_mut() };
+
+        loop {
+            match &mut this.internal.state {
+                State::Initial => {
+                    let lim = this.lim.as_ref();
+
+                    // Safety: The task is not linked up yet, so we can safely
+                    // inspect the number of permits without having to
+                    // synchronize.
+                    if this.permits == 0 {
+                        this.internal.state = State::Complete;
+                        return Poll::Ready(());
                     }
-                },
-                _ = interval.tick() => {
-                    amount = amount.saturating_add(self.refill_amount);
 
-                    loop {
-                        let task = match queue.pop_front() {
-                            Some(task) => task,
-                            None => {
-                                // Nothing to wake up, subtract the number of
-                                // tokens immediately allowing future acquires to
-                                // enter the fast path.
-                                self.balance_tokens(mem::take(&mut amount));
-                                continue 'outer;
+                    // Test the fast path first, where we simply subtract
+                    // the permits available from the current balance.
+                    let old = lim.balance.fetch_add(this.permits, Ordering::AcqRel);
+                    let current = old.saturating_add(this.permits);
+
+                    if current <= lim.max {
+                        this.internal.state = State::Complete;
+                        return Poll::Ready(());
+                    }
+
+                    let remaining = usize::min(current - lim.max, this.permits);
+
+                    unsafe {
+                        (*this.internal.linking.task.get()).remaining = remaining;
+                    }
+                    trace!("no immediate tokens available");
+                    this.internal.state = State::Waiting;
+                }
+                State::Waiting => {
+                    let lim = this.lim.as_ref();
+
+                    unsafe {
+                        // If we are complete, then return as ready.
+                        //
+                        // This field is atomic, so we can safely read it under shared
+                        // access and do not require a lock.
+                        if this.internal.complete.load(Ordering::Acquire) {
+                            this.internal.state = State::Complete;
+                            return Poll::Ready(());
+                        }
+
+                        // Try to take over as core. If we're unsuccessful we just ensure
+                        // that we're linked into the wait queue.
+                        if !lim.available.swap(false, Ordering::AcqRel) {
+                            let mut waiters = lim.waiters.lock();
+                            this.internal.linking.update(
+                                &mut *waiters,
+                                cx.waker(),
+                                &this.internal.complete,
+                            );
+                            return Poll::Pending;
+                        }
+
+                        let mut core = *lim.core.get();
+
+                        let rem = {
+                            this.internal.linking.core_link(lim);
+
+                            match this.internal.linking.next_sleep(&mut core, lim) {
+                                Some(rem) => rem,
+                                None => {
+                                    // Marks as completed.
+                                    this.internal.state = State::Complete;
+                                    return Poll::Ready(());
+                                }
                             }
                         };
 
-                        if amount < task.required {
-                            queue.push_front(task);
-                            break
-                        }
-
-                        // We have enough tokens to wake up the next task.
-                        // Subtract it from the current amount and notify the task to wake up.
-                        amount -= task.required;
-                        let result = task.completion.send(());
-                        debug_assert!(!result.is_err());
+                        trace!(sleep = ?rem, "taking over core and sleeping");
+                        this.internal.state = State::Core {
+                            core,
+                            sleep: time::sleep(rem),
+                        };
                     }
-                },
+                }
+                State::Core { core, sleep } => {
+                    let lim = this.lim.as_ref();
+
+                    let mut sleep = unsafe { Pin::new_unchecked(sleep) };
+
+                    if sleep.as_mut().poll(cx).is_pending() {
+                        return Poll::Pending;
+                    }
+
+                    let now = time::Instant::now();
+                    trace!(now = ?now, "sleep completed");
+                    core.last = now;
+
+                    // Safety: we know that we're the only one with access to core
+                    // because we ensured it as we acquire the `available` lock.
+                    unsafe {
+                        if this.internal.linking.refill_release(core, lim) {
+                            this.internal.state = State::Complete;
+                            return Poll::Ready(());
+                        }
+                    }
+
+                    let duration = time::Duration::from_millis(lim.interval as u64);
+                    trace!(sleep = ?duration, "keeping core and sleeping");
+                    sleep.as_mut().reset(now + duration);
+                }
+                State::Complete => {
+                    panic!("polled after completion")
+                }
             }
         }
+    }
+}
 
-        Ok(())
+impl<T> Drop for AcquireFut<T>
+where
+    T: AsRef<RateLimiter>,
+{
+    fn drop(&mut self) {
+        match &mut self.internal.state {
+            State::Waiting => {
+                let lim = self.lim.as_ref();
+
+                unsafe {
+                    // While the node is linked into the wait queue we have to ensure
+                    // it's only accessed under a lock, but once it's been unlinked we
+                    // can do what we want with it.
+                    let node = {
+                        let mut waiters = lim.waiters.lock();
+                        let task = self.internal.linking.task.get_mut();
+                        waiters.remove(task.into());
+                        task
+                    };
+
+                    // Remove own permits from balance. We are guaranteed that
+                    // this has been incremented beforehand.
+                    let current = lim.balance.fetch_sub(node.remaining, Ordering::AcqRel);
+
+                    debug_assert! {
+                        current >= node.remaining,
+                        "remaining permits doesn't match expected; {} >= {}",
+                        current,
+                        node.remaining
+                    };
+                }
+            }
+            State::Core { core, .. } => unsafe {
+                let lim = self.lim.as_ref();
+                let mut waiters = lim.waiters.lock();
+
+                if lim.fair {
+                    waiters.remove(self.internal.linking.task.get_mut().into());
+                }
+
+                self.internal.linking.release(&mut *waiters, *core, lim);
+            },
+            _ => (),
+        }
+    }
+}
+
+/// Some state of the acquire broken up so we can satisfy the borrow checker
+/// more easily.
+struct Linking {
+    /// If we are linked or not.
+    linked: bool,
+    /// The node in the linked list (if present).
+    task: UnsafeCell<Node<Task>>,
+}
+
+impl Linking {
+    /// Ensure that the current task is linked once into the shared queue.
+    unsafe fn link(&mut self, waiters: &mut LinkedList<Task>) {
+        debug_assert!(!self.linked);
+        self.linked = true;
+        waiters.push_front(self.task.get_mut().into());
     }
 
-    /// Subtract the given amount of tokens, allowing them to be used by the fast path acquire.
-    fn balance_tokens(&self, amount: usize) {
-        if amount == 0 {
+    /// Ensure that the current task is not linked in the wait queue.
+    ///
+    /// This is done once the current task steals the coordinator core.
+    unsafe fn unlink(&mut self, waiters: &mut LinkedList<Task>) {
+        debug_assert!(self.linked);
+        self.linked = false;
+        waiters.remove(self.task.get_mut().into());
+    }
+
+    /// Update the waiting state for this acquisition task. This might require
+    /// that we update the associated waker.
+    unsafe fn update(
+        &mut self,
+        waiters: &mut LinkedList<Task>,
+        waker: &Waker,
+        complete: &AtomicBool,
+    ) {
+        if !self.linked {
+            self.link(waiters);
+        }
+
+        // Safety: we're ensured to do this under the waiters lock since we've
+        // passed the relevant guard in through `waiters`.
+        let task = &mut *self.task.get();
+
+        let w = &mut task.waker;
+
+        let new_waker = match w {
+            None => true,
+            Some(w) => !w.will_wake(waker),
+        };
+
+        if new_waker {
+            *w = Some(waker.clone());
+        }
+
+        if task.complete.is_none() {
+            task.complete = Some(complete.into());
+        }
+    }
+
+    // Ensure that the current core task is correctly linked up if needed.
+    unsafe fn core_link(&mut self, lim: &RateLimiter) {
+        if lim.fair {
+            // Fair scheduling needs to ensure that the core is part
+            // of the wait queue, and will be woken up in-order with
+            // other tasks.
+            if !self.linked {
+                self.link(&mut *lim.waiters.lock());
+            }
+
             return;
         }
 
-        let mut current = self.tokens.load(Ordering::Acquire);
-
-        while current > 0 {
-            let new = current.saturating_sub(amount);
-
-            match self.tokens.compare_exchange_weak(
-                current,
-                new,
-                Ordering::SeqCst,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(x) => current = x,
-            }
-        }
-    }
-}
-
-/// The leaky bucket.
-#[derive(Clone)]
-pub struct LeakyBucket {
-    inner: Arc<Inner>,
-    /// Sender for emitting queued tasks.
-    task_tx: mpsc::Sender<Task>,
-}
-
-impl std::fmt::Debug for LeakyBucket {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.inner.fmt(f)
-    }
-}
-
-impl LeakyBucket {
-    /// Construct a new leaky bucket through a builder.
-    #[cfg(feature = "static")]
-    pub fn builder() -> Builder<'static> {
-        LEAKY_BUCKETS.rate_limiter()
-    }
-
-    /// Query how many tokens are available.
-    ///
-    /// This is just a best-effort estimate, calling this to ensure that there
-    /// are enough tokens available to avoid blocking does not guarantee that
-    /// the acquire operation won't block.
-    ///
-    /// Tokens is always reported as less than or equal to `max`.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use leaky_bucket::LeakyBucket;
-    /// use std::{error::Error, time::Duration};
-    ///
-    /// #[tokio::main]
-    /// async fn main() -> Result<(), Box<dyn Error>> {
-    ///     let rate_limiter = LeakyBucket::builder()
-    ///         .max(5)
-    ///         .tokens(0)
-    ///         .build()?;
-    ///
-    ///     assert_eq!(0, rate_limiter.tokens());
-    ///
-    ///     println!("Waiting for permit...");
-    ///     // should take about 5 seconds to acquire.
-    ///     rate_limiter.acquire_one().await?;
-    ///     println!("I made it!");
-    ///
-    ///     assert!(rate_limiter.tokens() >= 0 && rate_limiter.tokens() <= rate_limiter.max());
-    ///     Ok(())
-    /// }
-    /// ```
-    pub fn tokens(&self) -> usize {
-        let tokens = self.inner.tokens.load(Ordering::Acquire);
-        self.inner.max.saturating_sub(tokens)
-    }
-
-    /// Get the max number of tokens this rate limiter is configured for.
-    #[inline]
-    pub fn max(&self) -> usize {
-        self.inner.max
-    }
-
-    /// Acquire a single token.
-    ///
-    /// This is identical to [`acquire`] with an argument of `1`.
-    ///
-    /// [`acquire`]: LeakyBucket::acquire
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use leaky_bucket::LeakyBucket;
-    /// use std::{error::Error, time::Duration};
-    ///
-    /// #[tokio::main]
-    /// async fn main() -> Result<(), Box<dyn Error>> {
-    ///     let rate_limiter = LeakyBucket::builder()
-    ///         .max(5)
-    ///         .tokens(0)
-    ///         .build()?;
-    ///
-    ///     assert_eq!(0, rate_limiter.tokens());
-    ///
-    ///     println!("Waiting for permit...");
-    ///     // should take about 5 seconds to acquire.
-    ///     rate_limiter.acquire_one().await?;
-    ///     println!("I made it!");
-    ///
-    ///     assert_eq!(0, rate_limiter.tokens());
-    ///     Ok(())
-    /// }
-    /// ```
-    #[inline]
-    pub async fn acquire_one(&self) -> Result<(), Error> {
-        self.acquire(1).await
-    }
-
-    /// Acquire the given `amount` of tokens.
-    ///
-    /// Note that you *are* allowed to acquire more tokens than the current
-    /// `max`, but the acquire will have to suspend the task until enough
-    /// tokens has built up to satisfy the request.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use leaky_bucket::LeakyBucket;
-    /// use std::{error::Error, time::Duration};
-    ///
-    /// #[tokio::main]
-    /// async fn main() -> Result<(), Box<dyn Error>> {
-    ///     let rate_limiter = LeakyBucket::builder()
-    ///         .max(5)
-    ///         .tokens(5)
-    ///         .build()?;
-    ///
-    ///     assert_eq!(5, rate_limiter.tokens());
-    ///
-    ///     println!("Waiting for permit...");
-    ///     // should take about 5 seconds to acquire.
-    ///     rate_limiter.acquire(10).await?;
-    ///     println!("I made it!");
-    ///
-    ///     assert_eq!(0, rate_limiter.tokens());
-    ///     Ok(())
-    /// }
-    /// ```
-    ///
-    /// # Errors
-    ///
-    /// The returned future will fail with an [`Error::TokenOverflow`] if the
-    /// tracked number of tokens attempts to overflow the internal token
-    /// counter, which is an `usize`.
-    ///
-    /// For this reason you should prefer to use smaller values in the amount
-    /// acquired.
-    ///
-    /// [`Error::TokenOverflow`]: self::Error::TokenOverflow
-    pub async fn acquire(&self, amount: usize) -> Result<(), Error> {
-        let mut required = amount;
-
-        let mut current = self.inner.tokens.load(Ordering::Acquire);
-        let mut new;
-
-        loop {
-            new = match current.checked_add(required) {
-                Some(new) => new,
-                None => {
-                    return Err(Error::TokenOverflow);
-                }
-            };
-
-            match self.inner.tokens.compare_exchange_weak(
-                current,
-                new,
-                Ordering::SeqCst,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(x) => {
-                    current = x;
-                }
-            }
-        }
-
-        // fast path, we successfully acquired the number of tokens needed to proceed.
-        if new < self.inner.max {
-            return Ok(());
-        }
-
-        // Slow path:
+        // The local count of permits is set to 0 once a task has been linked
+        // into the wait queue.
         //
-        // Subtract the number of tokens already consumed from required and
-        // enqueue a task to be awoken when the given number of tokens is
-        // available.
-        if current < self.inner.max {
-            required -= self.inner.max - current;
+        // The core task is not supposed to be in the wait queue, so remove it
+        // from there if we've successfully stolen it.
+        if !self.linked {
+            return;
         }
 
-        let (completion, completion_rx) = oneshot::channel();
+        // Ensure that the current task is *not* linked since it is now to
+        // become the coordinator for everyone else.
+        self.unlink(&mut *lim.waiters.lock());
+    }
 
-        self.task_tx
-            .clone()
-            .send(Task {
-                required,
-                completion,
-            })
-            .await
-            .map_err(|_| Error::TaskSendError)?;
+    /// Refill the worker and release core if appropriate.
+    unsafe fn refill_release(&mut self, core: &mut Core, lim: &RateLimiter) -> bool {
+        let mut waiters = lim.waiters.lock();
 
-        completion_rx.await.map_err(|_| Error::TaskWaitError)?;
-        Ok(())
+        if self.refill(&mut waiters, lim.refill, lim) {
+            self.release(&mut *waiters, *core, lim);
+            return true;
+        }
+
+        false
+    }
+
+    /// Release the given number of tokens from the wait queue.
+    ///
+    /// Returns `true` if the current core has been completed and needs to be
+    /// released.
+    fn refill(
+        &mut self,
+        waiters: &mut MutexGuard<'_, LinkedList<Task>>,
+        refill: usize,
+        lim: &RateLimiter,
+    ) -> bool {
+        trace!(refill = refill, "refilling tokens");
+        let mut current = refill;
+
+        let mut bump = 0;
+
+        // Safety: we're holding the lock guard to all the waiters so we can be
+        // sure that we have exclusive access to the wait queue.
+        unsafe {
+            while current > 0 {
+                let mut node = match waiters.pop_back() {
+                    Some(node) => node,
+                    None => break,
+                };
+
+                let n = node.as_mut();
+                let before = n.remaining;
+                n.fill(&mut current);
+
+                trace! {
+                    current = current,
+                    before = before,
+                    remaining = n.remaining,
+                    "filled node",
+                };
+
+                if n.is_completed() {
+                    if let Some(complete) = n.complete {
+                        complete.as_ref().store(true, Ordering::Release);
+                    }
+
+                    if let Some(waker) = n.waker.take() {
+                        waker.wake();
+                    }
+                } else {
+                    waiters.push_back(node);
+                    break;
+                }
+
+                bump += 1;
+
+                if bump == BUMP_LIMIT {
+                    MutexGuard::bump(waiters);
+                    bump = 0;
+                }
+            }
+        }
+
+        if refill > 0 {
+            let mut old = lim.balance.load(Ordering::Relaxed);
+
+            loop {
+                let new = old.saturating_sub(refill);
+
+                match lim.balance.compare_exchange_weak(
+                    old,
+                    new,
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(x) => old = x,
+                }
+            }
+        }
+
+        // If the limiter is not fair, we need to in addition to draining
+        // remaining tokens from linked nodes, drain it from ourselves.
+        if !lim.fair {
+            // We fill the current holder of the core last (self). To ensure
+            // that it stays around for as long as possible.
+            //
+            // Safety: we know that no one else holds the task at this point.
+            let c = self.task.get_mut();
+            c.fill(&mut current);
+            c.is_completed()
+        } else {
+            // We only need to check the state since the current core holder is
+            // linked up to the wait queue.
+            //
+            // Safety: we're doing this under the waiters lock so we know we
+            // have exclusive access to the node.
+            unsafe { (*self.task.get()).is_completed() }
+        }
+    }
+
+    /// Calculate and process the next core sleep.
+    fn next_sleep(&mut self, core: &mut Core, lim: &RateLimiter) -> Option<time::Duration> {
+        // Safety: we guard exclusive access to the core through the `available`
+        // field.
+        let last = core.last;
+
+        let now = time::Instant::now();
+        let d =
+            usize::try_from(now.saturating_duration_since(last).as_millis()).unwrap_or(usize::MAX);
+
+        if d <= lim.interval {
+            // We still have to wait for the remainder of an interval before we
+            // can fill up with more tokens.
+            return Some(time::Duration::from_millis(
+                u64::try_from(lim.interval - d).unwrap_or(u64::MAX),
+            ));
+        }
+
+        // it is appropriate to immediately add more permits.
+        let refill_periods = d / lim.interval;
+
+        let rem = time::Duration::from_millis(u64::try_from(d % lim.interval).unwrap_or(u64::MAX));
+
+        debug_assert! {
+            refill_periods > 0,
+            "refill periods should be larger than 0"
+        };
+
+        let refill = refill_periods.saturating_mul(lim.refill);
+
+        let mut waiters = lim.waiters.lock();
+
+        if !self.refill(&mut waiters, refill, lim) {
+            return Some(rem);
+        }
+
+        // We synthetically "ran" at the current time minus the remaining time
+        // we need to wait until the last update period.
+        core.last = now - rem;
+        self.release(&mut *waiters, *core, lim);
+        None
+    }
+
+    /// Release the current core. Beyond this point the current task may no
+    /// longer interact exclusively with the core.
+    fn release(&mut self, waiters: &mut LinkedList<Task>, core: Core, lim: &RateLimiter) {
+        // Hand the state of the core back.
+        //
+        // Safety: we're doing this right before we unset the available flag,
+        // ensuring that we do indeed have exclusive access to the state of the
+        // core.
+        unsafe {
+            *lim.core.get() = core;
+        }
+
+        // Marks the core as available for anyone else to steal.
+        lim.available.store(true, Ordering::Release);
+
+        // Find another task that might take over as core. Once it has acquired
+        // core status it will have to make sure it is no longer linked into the
+        // wait queue.
+        //
+        // We have to do this, because another task might miss that the core is
+        // available since it's hidden behind an atomic, so we wake any task up
+        // to ensure that it will always be picked up.
+        //
+        // Safety: We're holding the lock guard to all the waiters so we can be
+        // certain that we have exclusive access.
+        unsafe {
+            if let Some(mut node) = waiters.front_mut() {
+                if let Some(waker) = node.as_mut().waker.take() {
+                    waker.wake();
+                }
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, LeakyBuckets};
-    use futures::prelude::*;
-    use std::time::{Duration, Instant};
-    use tokio::time;
+    use super::{Acquire, AcquireOwned, RateLimiter};
 
-    #[tokio::test]
-    async fn test_debug() {
-        let expected_debug =
-            "LeakyBucket { tokens: 16, max: 20, refill_interval: 2s, refill_amount: 10 }";
+    fn is_send<T: Send>() {}
+    fn is_sync<T: Sync>() {}
 
-        let buckets = LeakyBuckets::new();
-        let leaky = buckets
-            .rate_limiter()
-            .tokens(5)
-            .max(20)
-            .refill_amount(10)
-            .refill_interval(Duration::from_millis(2000))
-            .build()
-            .expect("build rate limiter");
-        leaky.acquire_one().await.unwrap();
+    #[test]
+    fn assert_send_sync() {
+        is_send::<AcquireOwned>();
+        is_sync::<AcquireOwned>();
 
-        let actual_debug = format!("{:?}", leaky);
-        assert_eq!(expected_debug, &actual_debug);
-    }
+        is_send::<RateLimiter>();
+        is_sync::<RateLimiter>();
 
-    #[tokio::test]
-    async fn test_leaky_bucket() {
-        let interval = Duration::from_millis(20);
-
-        let mut buckets = LeakyBuckets::new();
-
-        let leaky = buckets
-            .rate_limiter()
-            .tokens(0)
-            .max(10)
-            .refill_amount(10)
-            .refill_interval(interval)
-            .build()
-            .expect("build rate limiter");
-
-        let mut wakeups = 0u32;
-        let mut duration = None;
-
-        let test = async {
-            let start = Instant::now();
-            leaky.acquire(10).await?;
-            wakeups += 1;
-            leaky.acquire(10).await?;
-            wakeups += 1;
-            leaky.acquire(10).await?;
-            wakeups += 1;
-            duration = Some(Instant::now().duration_since(start));
-
-            Ok::<_, Error>(())
-        };
-
-        futures::future::select(test.boxed(), buckets.coordinate().unwrap().boxed()).await;
-
-        assert_eq!(3, wakeups);
-        assert!(duration.expect("expected measured duration") > interval * 2);
-    }
-
-    #[tokio::test]
-    async fn test_concurrent_rate_limited() {
-        let interval = Duration::from_millis(20);
-
-        let mut buckets = LeakyBuckets::new();
-
-        let leaky = buckets
-            .rate_limiter()
-            .tokens(0)
-            .max(10)
-            .refill_amount(1)
-            .refill_interval(interval)
-            .build()
-            .expect("build rate limiter");
-
-        let mut one_wakeups = 0;
-
-        let one = async {
-            loop {
-                leaky.acquire(1).await?;
-                one_wakeups += 1;
-            }
-
-            #[allow(unreachable_code)]
-            Ok::<_, Error>(())
-        };
-
-        let mut two_wakeups = 0u32;
-
-        let two = async {
-            loop {
-                leaky.acquire(1).await?;
-                two_wakeups += 1;
-            }
-
-            #[allow(unreachable_code)]
-            Ok::<_, Error>(())
-        };
-
-        let delay = time::sleep(Duration::from_millis(200));
-
-        let task = future::select(one.boxed(), two.boxed());
-        let task = future::select(task, delay.boxed());
-
-        future::select(task, buckets.coordinate().unwrap().boxed()).await;
-
-        let total = one_wakeups + two_wakeups;
-
-        assert!(total > 5 && total < 15);
-    }
-
-    /// See: https://github.com/udoprog/leaky-bucket/issues/5#issuecomment-703205787
-    #[tokio::test]
-    async fn test_graceful_shutdown_coordinator() {
-        let interval = Duration::from_millis(20);
-
-        let mut buckets = LeakyBuckets::new();
-
-        let leaky = buckets
-            .rate_limiter()
-            .tokens(0)
-            .max(10)
-            .refill_amount(1)
-            .refill_interval(interval)
-            .build()
-            .expect("build rate limiter");
-
-        let coordinator = buckets.coordinate().unwrap();
-
-        let task = tokio::spawn(async move {
-            assert!(coordinator.await.is_ok());
-        });
-
-        drop(leaky);
-        drop(buckets);
-
-        task.await.unwrap();
+        is_send::<Acquire<'_>>();
+        is_sync::<Acquire<'_>>();
     }
 }

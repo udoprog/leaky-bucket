@@ -1,23 +1,17 @@
-use leaky_bucket::LeakyBuckets;
+use leaky_bucket::RateLimiter;
 use std::time::{Duration, Instant};
 
 #[tokio::test]
 async fn test_issue5_a() {
-    let mut buckets = LeakyBuckets::new();
-    let coordinator = buckets.coordinate().unwrap();
-    tokio::spawn(async move { coordinator.await.unwrap() });
-
-    let rate_limiter = buckets
-        .rate_limiter()
-        .refill_amount(1)
-        .refill_interval(Duration::from_millis(100))
-        .build()
-        .expect("LeakyBucket builder failed");
+    let limiter = RateLimiter::builder()
+        .refill(1)
+        .interval(Duration::from_millis(100))
+        .build();
 
     let begin = Instant::now();
 
     for _ in 0..10 {
-        rate_limiter.acquire_one().await.expect("No reason to fail");
+        limiter.acquire_one().await;
     }
 
     let elapsed = Instant::now().duration_since(begin);
@@ -27,21 +21,15 @@ async fn test_issue5_a() {
 
 #[tokio::test]
 async fn test_issue5_b() {
-    let mut buckets = LeakyBuckets::new();
-    let coordinator = buckets.coordinate().unwrap();
-    tokio::spawn(async move { coordinator.await.unwrap() });
-
-    let rate_limiter = buckets
-        .rate_limiter()
-        .refill_amount(1)
-        .refill_interval(Duration::from_secs(2))
-        .build()
-        .expect("LeakyBucket builder failed");
+    let limiter = RateLimiter::builder()
+        .refill(1)
+        .interval(Duration::from_secs(2))
+        .build();
 
     let begin = Instant::now();
 
     for _ in 0..2 {
-        rate_limiter.acquire_one().await.expect("No reason to fail");
+        limiter.acquire_one().await;
     }
 
     let elapsed = Instant::now().duration_since(begin);
