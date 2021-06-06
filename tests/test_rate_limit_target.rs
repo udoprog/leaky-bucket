@@ -7,7 +7,7 @@ use std::time;
 /// reasonable amount of tokens at a slowish rate reaches the given target.
 #[tokio::test]
 async fn test_rate_limit_target() {
-    const TARGET: usize = 500;
+    const TARGET: usize = 1000;
     const INTERVALS: usize = 10;
     const DURATION: u64 = 2000;
     const TARGET_DIFFERENCE: u32 = 20;

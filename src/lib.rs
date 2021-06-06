@@ -204,7 +204,7 @@ use std::future::Future;
 use std::marker;
 use std::pin::Pin;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use tokio::time;
@@ -263,14 +263,6 @@ impl Task {
 unsafe impl Send for Task {}
 unsafe impl Sync for Task {}
 
-/// Core associated with the task that is currently responsible for driving the
-/// rate limiter.
-#[derive(Debug, Clone, Copy)]
-struct Core {
-    /// Last time tokens were added.
-    last: time::Instant,
-}
-
 /// A borrowed rate limiter.
 struct BorrowedRateLimiter<'a>(&'a RateLimiter);
 
@@ -281,25 +273,53 @@ impl AsRef<RateLimiter> for BorrowedRateLimiter<'_> {
 }
 
 struct Critical {
+    /// Current balance of tokens. A value of 0 means that it is empty. Goes up
+    /// to [`RateLimiter::max`].
+    balance: usize,
     /// Waiter list.
     waiters: LinkedList<Task>,
-    /// The current rate limiter core. This is exclusively used by the first
-    /// task that blocks due to rate limiting and migrates from task to task.
-    /// Access to the core is guarded by the `available` field.
-    core: Core,
+    /// The deadline for when more tokens can be be added.
+    deadline: time::Instant,
     /// If the core is available.
     available: bool,
 }
 
+impl Critical {
+    /// Release the current core. Beyond this point the current task may no
+    /// longer interact exclusively with the core.
+    #[tracing::instrument(skip(self), level = "trace")]
+    fn release(&mut self) {
+        trace!("releasing core");
+        self.available = true;
+
+        // Find another task that might take over as core. Once it has acquired
+        // core status it will have to make sure it is no longer linked into the
+        // wait queue.
+        //
+        // We have to do this, because another task might miss that the core is
+        // available since it's hidden behind an atomic, so we wake any task up
+        // to ensure that it will always be picked up.
+        //
+        // Safety: We're holding the lock guard to all the waiters so we can be
+        // certain that we have exclusive access.
+        unsafe {
+            if let Some(mut node) = self.waiters.front_mut() {
+                trace!(node = ?node, "waking next core");
+
+                if let Some(waker) = node.as_mut().waker.take() {
+                    waker.wake();
+                }
+            }
+        }
+    }
+}
+
 /// A token-bucket rate limiter.
 pub struct RateLimiter {
-    /// Current balance of tokens. A value of 0 means that it is empty. Goes up
-    /// to [`RateLimiter::max`].
-    balance: AtomicUsize,
     /// Tokens to add every `per` duration.
     refill: usize,
     /// Interval in milliseconds to add tokens.
-    interval: usize,
+    interval: time::Duration,
     /// Max number of tokens associated with the rate limiter.
     max: usize,
     /// If the rate limiter is fair or not.
@@ -349,8 +369,7 @@ impl RateLimiter {
     /// # }
     /// ```
     pub fn balance(&self) -> usize {
-        let balance = self.balance.load(Ordering::Acquire);
-        self.max.saturating_sub(balance)
+        self.critical.lock().balance
     }
 
     /// Acquire a single permit.
@@ -481,7 +500,7 @@ pub struct Builder {
     /// Tokens to add every `per` duration.
     refill: usize,
     /// Interval to add tokens in milliseconds.
-    interval: usize,
+    interval: time::Duration,
     /// If the rate limiter is fair or not.
     fair: bool,
 }
@@ -565,10 +584,14 @@ impl Builder {
     ///
     /// [`refill`]: Builder::refill
     pub fn interval(&mut self, interval: time::Duration) -> &mut Self {
-        let interval = usize::try_from(interval.as_millis())
-            .expect("refill interval out of millisecond bounds");
-        assert!(interval > 0, "interval must not be zero");
-
+        assert! {
+            interval.as_millis() != 0,
+            "interval must be non-zero",
+        };
+        assert! {
+            u64::try_from(interval.as_millis()).is_ok(),
+            "interval must fit within a 64-bit integer"
+        };
         self.interval = interval;
         self
     }
@@ -633,26 +656,24 @@ impl Builder {
     ///     .build();
     /// ```
     pub fn build(&self) -> RateLimiter {
-        let core = Core {
-            last: time::Instant::now(),
-        };
+        let deadline = time::Instant::now() + self.interval;
 
         let max = match self.max {
             Some(max) => max,
             None => usize::max(self.refill, self.initial).saturating_mul(DEFAULT_REFILL_MAX_FACTOR),
         };
 
-        let initial = max.saturating_sub(self.initial);
+        let initial = usize::min(self.initial, max);
 
         RateLimiter {
-            balance: AtomicUsize::new(initial),
             refill: self.refill,
             interval: self.interval,
             max,
             fair: self.fair,
             critical: Mutex::new(Critical {
-                core,
+                balance: initial,
                 waiters: LinkedList::new(),
+                deadline,
                 available: true,
             }),
         }
@@ -674,7 +695,7 @@ impl Default for Builder {
             max: None,
             initial: 0,
             refill: 1,
-            interval: 100,
+            interval: time::Duration::from_millis(100),
             fair: true,
         }
     }
@@ -691,8 +712,6 @@ enum State {
     /// We need to take care to ensure that we don't move the configured sleep.
     /// Since it needs to be pinned to be polled.
     Core {
-        /// The state of the core.
-        core: Core,
         /// The current sleep of the core.
         sleep: time::Sleep,
     },
@@ -813,51 +832,31 @@ impl AcquireState {
         }
     }
 
-    /// Refill the worker and release core if appropriate.
-    #[tracing::instrument(skip(self, core, lim), level = "trace")]
-    unsafe fn refill_release(&mut self, core: &mut Core, lim: &RateLimiter) -> bool {
-        let mut critical = lim.critical.lock();
-
-        if self.exclusive_refill(&mut critical, lim.refill, lim) {
-            self.release(&mut critical, *core);
-            return true;
-        }
-
-        false
-    }
-
     /// Release the given number of tokens from the wait queue.
     ///
     /// Returns `true` if the current core has been completed and needs to be
     /// released.
     #[tracing::instrument(skip(self, critical, lim), level = "trace")]
-    fn refill(
-        &self,
-        critical: &mut MutexGuard<'_, Critical>,
-        refill: usize,
-        lim: &RateLimiter,
-    ) -> usize {
+    fn refill(&self, critical: &mut MutexGuard<'_, Critical>, refill: usize, lim: &RateLimiter) {
+        critical.balance = usize::min(critical.balance.saturating_add(refill), lim.max);
         trace!(refill = refill, "refilling tokens");
-        let mut current = refill;
 
         let mut bump = 0;
 
         // Safety: we're holding the lock guard to all the waiters so we can be
         // sure that we have exclusive access to the wait queue.
         unsafe {
-            while current > 0 {
+            while critical.balance > 0 {
                 let mut node = match critical.waiters.pop_back() {
                     Some(node) => node,
                     None => break,
                 };
 
                 let n = node.as_mut();
-                let before = n.remaining;
-                n.fill(&mut current);
+                n.fill(&mut critical.balance);
 
                 trace! {
-                    current = current,
-                    before = before,
+                    balance = critical.balance,
                     remaining = n.remaining,
                     "filled node",
                 };
@@ -883,45 +882,17 @@ impl AcquireState {
                 }
             }
         }
-
-        if refill > 0 {
-            let mut old = lim.balance.load(Ordering::Relaxed);
-
-            loop {
-                let new = old.saturating_sub(refill);
-
-                trace! {
-                    old = old,
-                    new = new,
-                    refill = refill,
-                    current = current,
-                    "try updating balance"
-                };
-
-                match lim.balance.compare_exchange_weak(
-                    old,
-                    new,
-                    Ordering::SeqCst,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => break,
-                    Err(x) => old = x,
-                }
-            }
-        }
-
-        current
     }
 
     /// Refill that occurse when the current core is exclusively held.
     #[tracing::instrument(skip(self, critical, refill, lim), level = "trace")]
-    fn exclusive_refill(
+    fn core_refill(
         &mut self,
         critical: &mut MutexGuard<'_, Critical>,
         refill: usize,
         lim: &RateLimiter,
     ) -> bool {
-        let mut current = self.refill(critical, refill, lim);
+        self.refill(critical, refill, lim);
 
         if lim.fair {
             // We only need to check the state since the current core holder is
@@ -940,71 +911,41 @@ impl AcquireState {
         // Safety: we know that no one else holds the task at this point. The
         // in particular the task is not linked into the wait queue.
         let c = unsafe { &mut *self.task_mut() };
-        c.fill(&mut current);
+        c.fill(&mut critical.balance);
         c.is_completed()
     }
 
     /// Assume the current core and calculate how long we must sleep for in
     /// order to do it.
+    ///
+    /// # Safety
+    ///
+    /// This might link the current task into the task queue, so the caller must
+    /// ensure that it is pinned.
     #[tracing::instrument(skip(self, critical, lim), level = "trace")]
     unsafe fn assume_core(
         &mut self,
         critical: &mut MutexGuard<'_, Critical>,
         lim: &RateLimiter,
-    ) -> Option<(Core, time::Duration)> {
+    ) -> bool {
         self.core_link(critical, lim);
-        let mut core = critical.core;
 
-        let now = time::Instant::now();
-        let (refill, rem) = calculate_refill(now, core.last, lim);
-
-        let refill = match refill {
+        let (refill, deadline) = match calculate_refill(critical.deadline, lim.interval) {
             Some(refill) => refill,
-            None => {
-                return Some((core, rem));
-            }
+            None => return true,
         };
 
-        if !self.exclusive_refill(critical, refill, lim) {
-            return Some((core, rem));
+        // It is appropriate to update the deadline.
+        critical.deadline = deadline;
+
+        if !self.core_refill(critical, refill, lim) {
+            return true;
         }
 
         // We synthetically "ran" at the current time minus the remaining time
         // we need to wait until the last update period.
-        core.last = now - rem;
-        self.release(critical, core);
-        None
-    }
-
-    /// Release the current core. Beyond this point the current task may no
-    /// longer interact exclusively with the core.
-    #[tracing::instrument(skip(self, critical), level = "trace")]
-    fn release(&mut self, critical: &mut Critical, core: Core) {
-        trace!(core = ?core, "releasing core");
-
-        // Hand the state of the core back.
-        critical.core = core;
-        critical.available = true;
-
-        // Find another task that might take over as core. Once it has acquired
-        // core status it will have to make sure it is no longer linked into the
-        // wait queue.
-        //
-        // We have to do this, because another task might miss that the core is
-        // available since it's hidden behind an atomic, so we wake any task up
-        // to ensure that it will always be picked up.
-        //
-        // Safety: We're holding the lock guard to all the waiters so we can be
-        // certain that we have exclusive access.
-        unsafe {
-            if let Some(mut node) = critical.waiters.front_mut() {
-                trace!(node = ?node, "waking next core");
-
-                if let Some(waker) = node.as_mut().waker.take() {
-                    waker.wake();
-                }
-            }
-        }
+        critical.release();
+        false
     }
 }
 
@@ -1177,67 +1118,112 @@ where
                         return Poll::Ready(());
                     }
 
+                    let mut critical = lim.critical.lock();
+
+                    // If we've hit a deadline, calculate the number of tokens
+                    // to refill and perform it in line here. This is necessary
+                    // because the core isn't aware of how long we sleep between
+                    // each acquire, so we need to perform some of the refill
+                    // work here in order to avoid acruing a debt that needs to
+                    // be filled later in.
+                    //
+                    // If we didn't do this, and the process slept for a long
+                    // time, the next time a core is acquired it would be very
+                    // far removed from the expected deadline and has no idea
+                    // when permits were acquired, so it would over-eagerly
+                    // release a lot of acquires and accumulate permits.
+                    //
+                    // This is tested for in the `test_idle` suite of tests.
+                    if let Some((refill, deadline)) =
+                        calculate_refill(critical.deadline, lim.interval)
+                    {
+                        trace!("inline refill");
+                        // We pre-emptively update the deadline of the core
+                        // since it might bump, and we don't want other
+                        // processes to observe that the deadline has been
+                        // reached.
+                        critical.deadline = deadline;
+                        this.internal.refill(&mut critical, refill, lim);
+                    }
+
                     // Test the fast path first, where we simply subtract the
                     // permits available from the current balance.
-                    let old = lim.balance.fetch_add(this.permits, Ordering::AcqRel);
-                    let current = old.saturating_add(this.permits);
-
-                    if current <= lim.max {
+                    if critical.balance >= this.permits {
+                        critical.balance -= this.permits;
                         this.state = State::Complete;
                         return Poll::Ready(());
                     }
 
-                    let remaining = usize::min(current - lim.max, this.permits);
+                    let balance = std::mem::replace(&mut critical.balance, 0);
 
+                    // Safety: This is done in a pinned section, so we know that
+                    // the linked section stays alive for the duration of this
+                    // future due to pinning guarantees.
                     unsafe {
-                        this.internal.task_mut().remaining = remaining;
+                        this.internal.task_mut().remaining = this.permits - balance;
                     }
 
+                    // Try to take over as core. If we're unsuccessful we just
+                    // ensure that we're linked into the wait queue.
+                    if !std::mem::take(&mut critical.available) {
+                        this.internal.update(&mut critical, cx.waker());
+                        this.state = State::Waiting;
+                        return Poll::Pending;
+                    }
+
+                    // Safety: This is done in a pinned section, so we know that
+                    // the linked section stays alive for the duration of this
+                    // future due to pinning guarantees.
+                    unsafe { this.internal.core_link(&mut critical, lim) };
+
+                    trace!(until = ?critical.deadline, "taking over core and sleeping");
+                    this.state = State::Core {
+                        sleep: time::sleep_until(critical.deadline),
+                    };
+
                     trace!("no immediate tokens available");
-                    this.state = State::Waiting;
                 }
                 State::Waiting => {
                     let lim = this.lim.as_ref();
 
-                    unsafe {
-                        // If we are complete, then return as ready.
-                        //
-                        // This field is atomic, so we can safely read it under shared
-                        // access and do not require a lock.
-                        if this.internal.complete().load(Ordering::Acquire) {
-                            this.state = State::Complete;
-                            return Poll::Ready(());
-                        }
-
-                        // Note: we need to operate under this lock to ensure
-                        // that the core acquired here (or elsewhere) observes
-                        // that the current task has been linked up.
-                        let mut critical = lim.critical.lock();
-
-                        // Try to take over as core. If we're unsuccessful we
-                        // just ensure that we're linked into the wait queue.
-                        if !std::mem::take(&mut critical.available) {
-                            this.internal.update(&mut critical, cx.waker());
-                            return Poll::Pending;
-                        }
-
-                        let (core, rem) = match this.internal.assume_core(&mut critical, lim) {
-                            Some(output) => output,
-                            None => {
-                                // Marks as completed.
-                                this.state = State::Complete;
-                                return Poll::Ready(());
-                            }
-                        };
-
-                        trace!(sleep = ?rem, "taking over core and sleeping");
-                        this.state = State::Core {
-                            core,
-                            sleep: time::sleep(rem),
-                        };
+                    // If we are complete, then return as ready.
+                    //
+                    // This field is atomic, so we can safely read it under shared
+                    // access and do not require a lock.
+                    if this.internal.complete().load(Ordering::Acquire) {
+                        this.state = State::Complete;
+                        return Poll::Ready(());
                     }
+
+                    // Note: we need to operate under this lock to ensure that
+                    // the core acquired here (or elsewhere) observes that the
+                    // current task has been linked up.
+                    let mut critical = lim.critical.lock();
+
+                    // Try to take over as core. If we're unsuccessful we
+                    // just ensure that we're linked into the wait queue.
+                    if !std::mem::take(&mut critical.available) {
+                        this.internal.update(&mut critical, cx.waker());
+                        return Poll::Pending;
+                    }
+
+                    // Safety: This is done in a pinned section, so we know that
+                    // the linked section stays alive for the duration of this
+                    // future due to pinning guarantees.
+                    let assumed = unsafe { this.internal.assume_core(&mut critical, lim) };
+
+                    if !assumed {
+                        // Marks as completed.
+                        this.state = State::Complete;
+                        return Poll::Ready(());
+                    }
+
+                    trace!(until = ?critical.deadline, "taking over core and sleeping");
+                    this.state = State::Core {
+                        sleep: time::sleep_until(critical.deadline),
+                    };
                 }
-                State::Core { core, sleep } => {
+                State::Core { sleep } => {
                     let mut sleep = unsafe { Pin::new_unchecked(sleep) };
 
                     if sleep.as_mut().poll(cx).is_pending() {
@@ -1248,20 +1234,19 @@ where
 
                     let now = time::Instant::now();
                     trace!(now = ?now, "sleep completed");
-                    core.last = now;
+                    let mut critical = lim.critical.lock();
+                    critical.deadline = now + lim.interval;
 
                     // Safety: we know that we're the only one with access to core
                     // because we ensured it as we acquire the `available` lock.
-                    unsafe {
-                        if this.internal.refill_release(core, lim) {
-                            this.state = State::Complete;
-                            return Poll::Ready(());
-                        }
+                    if this.internal.core_refill(&mut critical, lim.refill, lim) {
+                        critical.release();
+                        this.state = State::Complete;
+                        return Poll::Ready(());
                     }
 
-                    let duration = time::Duration::from_millis(lim.interval as u64);
-                    trace!(sleep = ?duration, "keeping core and sleeping");
-                    sleep.as_mut().reset(now + duration);
+                    trace!(sleep = ?lim.interval, "keeping core and sleeping");
+                    sleep.as_mut().reset(critical.deadline);
                 }
                 State::Complete => {
                     panic!("polled after completion")
@@ -1284,26 +1269,12 @@ where
                     // While the node is linked into the wait queue we have to
                     // ensure it's only accessed under a lock, but once it's
                     // been unlinked we can do what we want with it.
-                    let node = {
-                        let mut critical = lim.critical.lock();
-                        let task = self.internal.task_mut();
-                        critical.waiters.remove(task.into());
-                        task
-                    };
-
-                    // Remove own permits from balance. We are guaranteed that
-                    // this has been incremented beforehand.
-                    let current = lim.balance.fetch_sub(node.remaining, Ordering::AcqRel);
-
-                    debug_assert! {
-                        current >= node.remaining,
-                        "remaining permits doesn't match expected; {} >= {}",
-                        current,
-                        node.remaining
-                    };
+                    let mut critical = lim.critical.lock();
+                    let task = self.internal.task_mut();
+                    critical.waiters.remove(task.into());
                 }
             }
-            State::Core { core, .. } => unsafe {
+            State::Core { .. } => unsafe {
                 let lim = self.lim.as_ref();
                 let mut critical = lim.critical.lock();
 
@@ -1311,7 +1282,7 @@ where
                     critical.waiters.remove(self.internal.task_mut().into());
                 }
 
-                self.internal.release(&mut critical, *core);
+                critical.release();
             },
             _ => (),
         }
@@ -1337,31 +1308,26 @@ struct Linking {
 /// Calculate refill amount. Returning a tuple of how much to fill and remaining
 /// duration to sleep until the next refill time if appropriate.
 fn calculate_refill(
-    now: time::Instant,
-    last: time::Instant,
-    lim: &RateLimiter,
-) -> (Option<usize>, time::Duration) {
-    let d = usize::try_from(now.saturating_duration_since(last).as_millis()).unwrap_or(usize::MAX);
+    deadline: time::Instant,
+    interval: time::Duration,
+) -> Option<(usize, time::Instant)> {
+    let now = time::Instant::now();
 
-    if d <= lim.interval {
-        // We still have to wait for the remainder of an interval before we
-        // can fill up with more tokens.
-        let rem = time::Duration::from_millis(u64::try_from(lim.interval - d).unwrap_or(u64::MAX));
-
-        return (None, rem);
+    if now < deadline {
+        return None;
     }
 
-    // it is appropriate to immediately add more permits.
-    let refill_periods = d / lim.interval;
+    // Time elapsed in milliseconds since the last deadline.
+    let millis = u64::try_from(interval.as_millis()).unwrap_or(u64::MAX);
+    let since =
+        u64::try_from(now.saturating_duration_since(deadline).as_millis()).unwrap_or(u64::MAX);
 
-    let rem = time::Duration::from_millis(u64::try_from(d % lim.interval).unwrap_or(u64::MAX));
+    let refill = usize::try_from(1 + since / millis).unwrap_or(usize::MAX);
+    let rem = since % millis;
 
-    debug_assert! {
-        refill_periods > 0,
-        "refill periods should be larger than 0"
-    };
-
-    (Some(refill_periods.saturating_mul(lim.refill)), rem)
+    // Calculated time remaining until the next deadline.
+    let deadline = now + (interval - time::Duration::from_millis(rem));
+    Some((refill, deadline))
 }
 
 #[cfg(test)]
