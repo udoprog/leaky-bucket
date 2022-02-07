@@ -21,7 +21,7 @@ a Tokio runtime with the [`time` feature] enabled.
 Add the following to your `Cargo.toml`:
 
 ```toml
-leaky-bucket = "0.11.0"
+leaky-bucket = "0.11.1"
 ```
 
 <br>
