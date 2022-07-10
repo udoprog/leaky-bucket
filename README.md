@@ -21,7 +21,7 @@ a Tokio runtime with the [`time` feature] enabled.
 Add the following to your `Cargo.toml`:
 
 ```toml
-leaky-bucket = "0.11.1"
+leaky-bucket = "0.12.0"
 ```
 
 <br>
@@ -47,7 +47,7 @@ async fn main() {
 
     println!("Waiting for permit...");
 
-    // Should take about 5 seconds to acquire in total.
+    // Should take ~400 ms to acquire in total.
     let a = limiter.acquire(7);
     let b = limiter.acquire(3);
     let c = limiter.acquire(10);

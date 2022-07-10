@@ -19,7 +19,7 @@
 //! Add the following to your `Cargo.toml`:
 //!
 //! ```toml
-//! leaky-bucket = "0.11.1"
+//! leaky-bucket = "0.12.0"
 //! ```
 //!
 //! <br>

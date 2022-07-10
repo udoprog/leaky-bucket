@@ -1,6 +1,6 @@
 [package]
 name = "leaky-bucket"
-version = "0.11.1"
+version = "0.12.0"
 authors = ["John-John Tedro <udoprog@tedro.se>"]
 edition = "2018"
 license = "MIT/Apache-2.0"
@@ -14,7 +14,7 @@ Futures-aware rate limiter implementation.
 categories = ["algorithms", "network-programming", "concurrency"]
 
 [dependencies]
-parking_lot = "0.11.1"
+parking_lot = "0.12.0"
 tokio = { version = "1", features = ["time"] }
 tracing = "0.1.26"
 
