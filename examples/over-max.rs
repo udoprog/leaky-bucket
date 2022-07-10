@@ -13,7 +13,7 @@ async fn main() {
 
     println!("Waiting for permit...");
 
-    // Should take about 5 seconds to acquire in total.
+    // Should take ~400 ms to acquire in total.
     let a = limiter.acquire(7);
     let b = limiter.acquire(3);
     let c = limiter.acquire(10);

@@ -45,7 +45,7 @@
 //!
 //!     println!("Waiting for permit...");
 //!
-//!     // Should take about 5 seconds to acquire in total.
+//!     // Should take ~400 ms to acquire in total.
 //!     let a = limiter.acquire(7);
 //!     let b = limiter.acquire(3);
 //!     let c = limiter.acquire(10);
@@ -201,7 +201,8 @@
 //! [`time` feature]: https://docs.rs/tokio/1/tokio/#feature-flags
 //! [leaky bucket]: https://en.wikipedia.org/wiki/Leaky_bucket
 
-#![deny(missing_docs, missing_doc_code_examples)]
+#![deny(missing_docs)]
+#![deny(rustdoc::missing_doc_code_examples)]
 
 use parking_lot::{Mutex, MutexGuard};
 use std::cell::UnsafeCell;
@@ -837,7 +838,7 @@ impl AcquireState {
         tokens: usize,
         lim: &RateLimiter,
     ) {
-        critical.balance = usize::min(critical.balance.saturating_add(tokens), lim.max);
+        critical.balance = critical.balance.saturating_add(tokens);
         trace!(tokens = tokens, "draining tokens");
 
         let mut bump = 0;
@@ -880,6 +881,10 @@ impl AcquireState {
                     bump = 0;
                 }
             }
+        }
+
+        if critical.balance > lim.max {
+            critical.balance = lim.max;
         }
     }
 
