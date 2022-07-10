@@ -353,6 +353,79 @@ impl RateLimiter {
         Builder::default()
     }
 
+    /// Get the refill amount  of this rate limiter as set through
+    /// [`Builder::refill`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use leaky_bucket::RateLimiter;
+    ///
+    /// let limiter = RateLimiter::builder()
+    ///     .refill(1024)
+    ///     .build();
+    ///
+    /// assert_eq!(limiter.refill(), 1024);
+    /// ```
+    pub fn refill(&self) -> usize {
+        self.refill
+    }
+
+    /// Get the refill interval of this rate limiter as set through
+    /// [`Builder::interval`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// use leaky_bucket::RateLimiter;
+    ///
+    /// let limiter = RateLimiter::builder()
+    ///     .interval(Duration::from_millis(1000))
+    ///     .build();
+    ///
+    /// assert_eq!(limiter.interval(), Duration::from_millis(1000));
+    /// ```
+    pub fn interval(&self) -> time::Duration {
+        self.interval
+    }
+
+    /// Get the max value of this rate limiter as set through [`Builder::max`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use leaky_bucket::RateLimiter;
+    ///
+    /// let limiter = RateLimiter::builder()
+    ///     .max(1024)
+    ///     .build();
+    ///
+    /// assert_eq!(limiter.max(), 1024);
+    /// ```
+    pub fn max(&self) -> usize {
+        self.max
+    }
+
+    /// Test if the current rate limiter is fair as specified through
+    /// [`Builder::fair`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use leaky_bucket::RateLimiter;
+    ///
+    /// let limiter = RateLimiter::builder()
+    ///     .fair(true)
+    ///     .build();
+    ///
+    /// assert_eq!(limiter.is_fair(), true);
+    /// ```
+    pub fn is_fair(&self) -> bool {
+        self.fair
+    }
+
     /// Get the current token balance.
     ///
     /// This indicates how many tokens can be requested without blocking.
