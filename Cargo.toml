@@ -3,14 +3,13 @@ name = "leaky-bucket"
 version = "0.12.1"
 authors = ["John-John Tedro <udoprog@tedro.se>"]
 edition = "2018"
-license = "MIT/Apache-2.0"
-readme = "README.md"
-repository = "https://github.com/udoprog/leaky-bucket"
-homepage = "https://github.com/udoprog/leaky-bucket"
+description = "Futures-aware rate limiter implementation."
 documentation = "https://docs.rs/leaky-bucket"
-description = """
-Futures-aware rate limiter implementation.
-"""
+readme = "README.md"
+homepage = "https://github.com/udoprog/leaky-bucket"
+repository = "https://github.com/udoprog/leaky-bucket"
+license = "MIT/Apache-2.0"
+keywords = ["ratelimit", "tokenbucket", "throttle"]
 categories = ["algorithms", "network-programming", "concurrency"]
 
 [dependencies]
