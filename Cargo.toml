@@ -9,8 +9,8 @@ readme = "README.md"
 homepage = "https://github.com/udoprog/leaky-bucket"
 repository = "https://github.com/udoprog/leaky-bucket"
 license = "MIT/Apache-2.0"
-keywords = ["ratelimit", "tokenbucket", "throttle"]
-categories = ["algorithms", "network-programming", "concurrency"]
+keywords = ["ratelimit", "throttle", "tokenbucket"]
+categories = ["algorithms", "concurrency", "network-programming"]
 
 [dependencies]
 parking_lot = "0.12.1"
