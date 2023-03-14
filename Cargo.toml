@@ -3,7 +3,7 @@ name = "leaky-bucket"
 version = "0.12.2"
 authors = ["John-John Tedro <udoprog@tedro.se>"]
 edition = "2018"
-rust-version = "1.56"
+rust-version = "1.59"
 description = "Futures-aware rate limiter implementation."
 documentation = "https://docs.rs/leaky-bucket"
 readme = "README.md"
@@ -15,12 +15,12 @@ categories = ["algorithms", "concurrency", "network-programming"]
 
 [dependencies]
 parking_lot = "0.12.1"
-tokio = { version = "1", features = ["time"] }
-tracing = "0.1.26"
+tokio = { version = "1.26.0", features = ["time"] }
+tracing = "0.1.37"
 
 [dev-dependencies]
-anyhow = "1.0.40"
-futures = "0.3"
+anyhow = "1.0.69"
+futures = "0.3.27"
 helpers = { path = "helpers" }
-pin-project = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "rt", "time"] }
+pin-project = "1.0.12"
+tokio = { version = "1.26.0", features = ["macros", "rt-multi-thread", "rt", "time"] }
