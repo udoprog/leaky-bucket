@@ -201,7 +201,6 @@
 //! [leaky bucket]: https://en.wikipedia.org/wiki/Leaky_bucket
 
 #![deny(missing_docs)]
-#![deny(rustdoc::missing_doc_code_examples)]
 
 use parking_lot::{Mutex, MutexGuard};
 use std::cell::UnsafeCell;
