@@ -18,16 +18,6 @@ a Tokio runtime with the [`time` feature] enabled.
 
 ## Usage
 
-Add the following to your `Cargo.toml`:
-
-```toml
-leaky-bucket = "0.12.2"
-```
-
-<br>
-
-## Examples
-
 The core type is the [`RateLimiter`] type, which allows for limiting the
 throughput of a section using its [`acquire`] and [`acquire_one`] methods.
 
