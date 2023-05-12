@@ -11,6 +11,19 @@
 //! Since this crate uses timing facilities from tokio it has to be used within
 //! a Tokio runtime with the [`time` feature] enabled.
 //!
+//! This library has some neat features, which includes:
+//!
+//! **Not requiring a background task**. This is usually needed by token bucket
+//! rate limiters to drive progress. Instead, one of the waiting tasks
+//! temporarily assumes the role as coordinator (called the *core*). This
+//! reduces the amount of tasks needing to sleep, which can be a source of
+//! jitter for imprecise sleeping implementations and tight limiters. See below
+//! for more details.
+//!
+//! **Dropped tasks** release any resources they've reserved. So that
+//! constructing and cancellaing asynchronous tasks to not end up taking up wait
+//! slots it never uses which would be the case for cell-based rate limiters.
+//!
 //! <br>
 //!
 //! ## Usage
@@ -194,6 +207,9 @@
 #![deny(missing_docs)]
 
 extern crate alloc;
+
+#[macro_use]
+extern crate std;
 
 use core::cell::UnsafeCell;
 use core::convert::TryFrom as _;
@@ -896,6 +912,27 @@ impl AcquireState {
         }
     }
 
+    /// Release any remaining tokens which are associated with this particular task.
+    unsafe fn release_remaining(
+        &mut self,
+        critical: &mut MutexGuard<'_, Critical>,
+        permits: usize,
+        lim: &RateLimiter,
+    ) {
+        if mem::take(&mut self.linked) {
+            critical.waiters.remove(self.task_mut().into());
+        }
+
+        // Hand back permits which we've acquired so far.
+        let release = permits.saturating_sub(self.linking.get_mut().task.remaining);
+
+        // Temporarily assume the role of core and release the remaining
+        // tokens to waiting tasks.
+        if release > 0 {
+            self.drain_wait_queue(critical, release, lim);
+        }
+    }
+
     /// Refill the wait queue with the given number of tokens.
     #[tracing::instrument(skip(self, critical, lim), level = "trace")]
     fn drain_wait_queue(
@@ -1356,15 +1393,13 @@ where
                 // ensure it's only accessed under a lock, but once it's been
                 // unlinked we can do what we want with it.
                 let mut critical = lim.critical.lock();
-                critical.waiters.remove(self.internal.task_mut().into());
+                self.internal
+                    .release_remaining(&mut critical, self.permits, lim);
             },
             State::Core { .. } => unsafe {
                 let mut critical = lim.critical.lock();
-
-                if mem::take(&mut self.internal.linked) {
-                    critical.waiters.remove(self.internal.task_mut().into());
-                }
-
+                self.internal
+                    .release_remaining(&mut critical, self.permits, lim);
                 critical.release();
             },
             _ => (),

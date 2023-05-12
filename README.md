@@ -14,6 +14,12 @@ of tokens has been drained from the bucket.
 Since this crate uses timing facilities from tokio it has to be used within
 a Tokio runtime with the [`time` feature] enabled.
 
+This library has some neat features, which includes:
+* Not requiring a background thread or task to *drip*. Instead, one of the
+  waiting tasks assumes the duty as coordinator called the *core*. See below
+  for more details.
+* Dropped tasks releases their partially acquired tokens.
+
 <br>
 
 ## Usage
