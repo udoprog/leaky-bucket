@@ -190,20 +190,25 @@
 //! [`time` feature]: https://docs.rs/tokio/1/tokio/#feature-flags
 //! [leaky bucket]: https://en.wikipedia.org/wiki/Leaky_bucket
 
+#![no_std]
 #![deny(missing_docs)]
 
+extern crate alloc;
+
+use core::cell::UnsafeCell;
+use core::convert::TryFrom as _;
+use core::fmt;
+use core::future::Future;
+use core::marker;
+use core::mem;
+use core::pin::Pin;
+use core::ptr;
+use core::sync::atomic::{AtomicBool, Ordering};
+use core::task::{Context, Poll, Waker};
+
+use alloc::sync::Arc;
+
 use parking_lot::{Mutex, MutexGuard};
-use std::cell::UnsafeCell;
-use std::convert::TryFrom as _;
-use std::fmt;
-use std::future::Future;
-use std::marker;
-use std::mem;
-use std::pin::Pin;
-use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::task::{Context, Poll, Waker};
 use tokio::time;
 use tracing::trace;
 

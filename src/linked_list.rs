@@ -1,10 +1,11 @@
 //! An intrusive linked list of waiters.
 
-use std::cell::UnsafeCell;
-use std::fmt;
-use std::marker;
-use std::ops;
-use std::ptr;
+use core::cell::UnsafeCell;
+use core::fmt;
+use core::marker;
+use core::ops;
+use core::ptr;
+
 use tracing::trace;
 
 #[repr(C)]
