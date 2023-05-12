@@ -15,10 +15,17 @@ Since this crate uses timing facilities from tokio it has to be used within
 a Tokio runtime with the [`time` feature] enabled.
 
 This library has some neat features, which includes:
-* Not requiring a background thread or task to *drip*. Instead, one of the
-  waiting tasks assumes the duty as coordinator called the *core*. See below
-  for more details.
-* Dropped tasks releases their partially acquired tokens.
+
+**Not requiring a background task**. This is usually needed by token bucket
+rate limiters to drive progress. Instead, one of the waiting tasks
+temporarily assumes the role as coordinator (called the *core*). This
+reduces the amount of tasks needing to sleep, which can be a source of
+jitter for imprecise sleeping implementations and tight limiters. See below
+for more details.
+
+**Dropped tasks** release any resources they've reserved. So that
+constructing and cancellaing asynchronous tasks to not end up taking up wait
+slots it never uses which would be the case for cell-based rate limiters.
 
 <br>
 
