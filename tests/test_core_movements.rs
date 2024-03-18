@@ -10,7 +10,7 @@ impl Wake for Waker {
     fn wake(self: Arc<Self>) {}
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_drop_core() {
     let limiter = RateLimiter::builder()
         .interval(time::Duration::from_millis(50))
@@ -43,7 +43,7 @@ async fn test_drop_core() {
     b1.await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_core_move() {
     let limiter = RateLimiter::builder()
         .interval(time::Duration::from_millis(50))
