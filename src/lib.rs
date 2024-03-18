@@ -224,6 +224,7 @@ use core::task::{Context, Poll, Waker};
 use alloc::sync::Arc;
 
 use parking_lot::{Mutex, MutexGuard};
+use pin_project_lite::pin_project;
 use tokio::time;
 use tracing::trace;
 
@@ -496,7 +497,9 @@ impl RateLimiter {
     /// # }
     /// ```
     pub fn acquire(&self, permits: usize) -> Acquire<'_> {
-        Acquire(AcquireFut::new(BorrowedRateLimiter(self), permits))
+        Acquire {
+            inner: AcquireFut::new(BorrowedRateLimiter(self), permits),
+        }
     }
 
     /// Acquire a permit using an owned future.
@@ -566,7 +569,9 @@ impl RateLimiter {
     /// # }
     /// ```
     pub fn acquire_owned(self: Arc<Self>, permits: usize) -> AcquireOwned {
-        AcquireOwned(AcquireFut::new(self, permits))
+        AcquireOwned {
+            inner: AcquireFut::new(self, permits),
+        }
     }
 }
 
@@ -786,23 +791,27 @@ impl Default for Builder {
     }
 }
 
-/// The state of an acquire operation.
-#[allow(clippy::large_enum_variant)]
-enum State {
-    /// Initial unconfigured state.
-    Initial,
-    /// The acquire is waiting to be released by the core.
-    Waiting,
-    /// This operation is currently the core.
-    ///
-    /// We need to take care to ensure that we don't move the configured sleep.
-    /// Since it needs to be pinned to be polled.
-    Core {
-        /// The current sleep of the core.
-        sleep: time::Sleep,
-    },
-    /// The operation is completed.
-    Complete,
+pin_project! {
+    /// The state of an acquire operation.
+    #[project = StateProj]
+    #[allow(clippy::large_enum_variant)]
+    enum State {
+        // Initial unconfigured state.
+        Initial,
+        // The acquire is waiting to be released by the core.
+        Waiting,
+        // This operation is currently the core.
+        //
+        // We need to take care to ensure that we don't move the configured sleep.
+        // Since it needs to be pinned to be polled.
+        Core {
+            #[pin]
+            // The current sleep of the core.
+            sleep: time::Sleep,
+        },
+        // The operation is completed.
+        Complete,
+    }
 }
 
 /// Internal state of the acquire. This is separated because it can be computed
@@ -1078,9 +1087,14 @@ impl fmt::Debug for AcquireState {
     }
 }
 
-/// The future associated with acquiring permits from a rate limiter using
-/// [`RateLimiter::acquire`].
-pub struct Acquire<'a>(AcquireFut<BorrowedRateLimiter<'a>>);
+pin_project! {
+    /// The future associated with acquiring permits from a rate limiter using
+    /// [`RateLimiter::acquire`].
+    pub struct Acquire<'a>{
+        #[pin]
+        inner: AcquireFut<BorrowedRateLimiter<'a>>
+    }
+}
 
 impl Acquire<'_> {
     /// Test if this acquire task is currently coordinating the rate limiter.
@@ -1116,7 +1130,7 @@ impl Acquire<'_> {
     /// # }
     /// ```
     pub fn is_core(&self) -> bool {
-        self.0.is_core()
+        self.inner.is_core()
     }
 }
 
@@ -1124,14 +1138,18 @@ impl Future for Acquire<'_> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let inner = unsafe { Pin::map_unchecked_mut(self, |this| &mut this.0) };
-        inner.poll(cx)
+        self.project().inner.poll(cx)
     }
 }
 
-/// The future associated with acquiring permits from a rate limiter using
-/// [`RateLimiter::acquire_owned`].
-pub struct AcquireOwned(AcquireFut<Arc<RateLimiter>>);
+pin_project! {
+    /// The future associated with acquiring permits from a rate limiter using
+    /// [`RateLimiter::acquire_owned`].
+    pub struct AcquireOwned{
+        #[pin]
+        inner: AcquireFut<Arc<RateLimiter>>
+    }
+}
 
 impl AcquireOwned {
     /// Test if this acquire task is currently coordinating the rate limiter.
@@ -1167,7 +1185,7 @@ impl AcquireOwned {
     /// # }
     /// ```
     pub fn is_core(&self) -> bool {
-        self.0.is_core()
+        self.inner.is_core()
     }
 }
 
@@ -1175,23 +1193,58 @@ impl Future for AcquireOwned {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let inner = unsafe { Pin::map_unchecked_mut(self, |this| &mut this.0) };
-        inner.poll(cx)
+        self.project().inner.poll(cx)
     }
 }
 
-struct AcquireFut<T>
-where
-    T: AsRef<RateLimiter>,
-{
-    /// Inner shared state.
-    lim: T,
-    /// The number of permits associated with this future.
-    permits: usize,
-    /// State of the acquisition.
-    state: State,
-    /// The internal acquire state.
-    internal: AcquireState,
+pin_project! {
+    struct AcquireFut<T>
+    where
+        T: AsRef<RateLimiter>,
+    {
+        // Inner shared state.
+        lim: T,
+        // The number of permits associated with this future.
+        permits: usize,
+        #[pin]
+        // State of the acquisition.
+        state: State,
+        // The internal acquire state.
+        internal: AcquireState,
+    }
+
+    impl<T> PinnedDrop for AcquireFut<T>
+    where
+        T: AsRef<RateLimiter>,
+    {
+        fn drop(this: Pin<&mut Self>) {
+            let this = this.project();
+            let lim = this.lim.as_ref();
+
+            match this.state.project() {
+                StateProj::Waiting => unsafe {
+                    debug_assert! {
+                        this.internal.linked,
+                        "waiting nodes have to be linked",
+                    };
+
+                    // While the node is linked into the wait queue we have to
+                    // ensure it's only accessed under a lock, but once it's been
+                    // unlinked we can do what we want with it.
+                    let mut critical = lim.critical.lock();
+                    this.internal
+                        .release_remaining(&mut critical, *this.permits, lim);
+                },
+                StateProj::Core { .. } => unsafe {
+                    let mut critical = lim.critical.lock();
+                    this.internal
+                        .release_remaining(&mut critical, *this.permits, lim);
+                    critical.release();
+                },
+                _ => (),
+            }
+        }
+    }
 }
 
 impl<T> AcquireFut<T>
@@ -1226,17 +1279,17 @@ where
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = unsafe { self.get_unchecked_mut() };
+        let mut this = self.project();
         let lim = this.lim.as_ref();
 
         loop {
-            match &mut this.state {
-                State::Initial => {
+            match this.state.as_mut().project() {
+                StateProj::Initial => {
                     // Safety: The task is not linked up yet, so we can safely
                     // inspect the number of permits without having to
                     // synchronize.
-                    if this.permits == 0 {
-                        this.state = State::Complete;
+                    if *this.permits == 0 {
+                        this.state.set(State::Complete);
                         return Poll::Ready(());
                     }
 
@@ -1270,9 +1323,9 @@ where
 
                     // Test the fast path first, where we simply subtract the
                     // permits available from the current balance.
-                    if let Some(balance) = critical.balance.checked_sub(this.permits) {
+                    if let Some(balance) = critical.balance.checked_sub(*this.permits) {
                         critical.balance = balance;
-                        this.state = State::Complete;
+                        this.state.set(State::Complete);
                         return Poll::Ready(());
                     }
 
@@ -1282,14 +1335,14 @@ where
                     // the linked section stays alive for the duration of this
                     // future due to pinning guarantees.
                     unsafe {
-                        this.internal.task_mut().remaining = this.permits - balance;
+                        this.internal.task_mut().remaining = *this.permits - balance;
                     }
 
                     // Try to take over as core. If we're unsuccessful we just
                     // ensure that we're linked into the wait queue.
                     if !mem::take(&mut critical.available) {
                         this.internal.update(&mut critical, cx.waker());
-                        this.state = State::Waiting;
+                        this.state.set(State::Waiting);
                         return Poll::Pending;
                     }
 
@@ -1299,19 +1352,19 @@ where
                     unsafe { this.internal.link_core(&mut critical, lim) };
 
                     trace!(until = ?critical.deadline, "taking over core and sleeping");
-                    this.state = State::Core {
+                    this.state.set(State::Core {
                         sleep: time::sleep_until(critical.deadline),
-                    };
+                    });
 
                     trace!("no immediate tokens available");
                 }
-                State::Waiting => {
+                StateProj::Waiting => {
                     // If we are complete, then return as ready.
                     //
                     // This field is atomic, so we can safely read it under shared
                     // access and do not require a lock.
                     if this.internal.complete().load(Ordering::Acquire) {
-                        this.state = State::Complete;
+                        this.state.set(State::Complete);
                         return Poll::Ready(());
                     }
 
@@ -1334,18 +1387,16 @@ where
 
                     if !assumed {
                         // Marks as completed.
-                        this.state = State::Complete;
+                        this.state.set(State::Complete);
                         return Poll::Ready(());
                     }
 
                     trace!(until = ?critical.deadline, "taking over core and sleeping");
-                    this.state = State::Core {
+                    this.state.set(State::Core {
                         sleep: time::sleep_until(critical.deadline),
-                    };
+                    });
                 }
-                State::Core { sleep } => {
-                    let mut sleep = unsafe { Pin::new_unchecked(sleep) };
-
+                StateProj::Core { mut sleep } => {
                     if sleep.as_mut().poll(cx).is_pending() {
                         return Poll::Pending;
                     }
@@ -1359,49 +1410,17 @@ where
                     // because we ensured it as we acquire the `available` lock.
                     if this.internal.drain_core(&mut critical, lim.refill, lim) {
                         critical.release();
-                        this.state = State::Complete;
+                        this.state.set(State::Complete);
                         return Poll::Ready(());
                     }
 
                     trace!(sleep = ?lim.interval, "keeping core and sleeping");
                     sleep.as_mut().reset(critical.deadline);
                 }
-                State::Complete => {
+                StateProj::Complete => {
                     panic!("polled after completion");
                 }
             }
-        }
-    }
-}
-
-impl<T> Drop for AcquireFut<T>
-where
-    T: AsRef<RateLimiter>,
-{
-    fn drop(&mut self) {
-        let lim = self.lim.as_ref();
-
-        match &mut self.state {
-            State::Waiting => unsafe {
-                debug_assert! {
-                    self.internal.linked,
-                    "waiting nodes have to be linked",
-                };
-
-                // While the node is linked into the wait queue we have to
-                // ensure it's only accessed under a lock, but once it's been
-                // unlinked we can do what we want with it.
-                let mut critical = lim.critical.lock();
-                self.internal
-                    .release_remaining(&mut critical, self.permits, lim);
-            },
-            State::Core { .. } => unsafe {
-                let mut critical = lim.critical.lock();
-                self.internal
-                    .release_remaining(&mut critical, self.permits, lim);
-                critical.release();
-            },
-            _ => (),
         }
     }
 }
