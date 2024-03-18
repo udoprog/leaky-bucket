@@ -1,12 +1,12 @@
 use std::pin::pin;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use tokio::time::{Duration, Instant};
 
 use leaky_bucket::RateLimiter;
 use tokio::task::JoinSet;
 use tokio::time::sleep;
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_drop() -> anyhow::Result<()> {
     let limiter = Arc::new(
         RateLimiter::builder()

@@ -4,7 +4,7 @@
 use leaky_bucket::RateLimiter;
 use tokio::time;
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_overflow() {
     let limiter = RateLimiter::builder()
         .max(5)
@@ -24,7 +24,7 @@ async fn test_overflow() {
     assert!(elapsed.as_millis() >= 500 && elapsed.as_millis() <= 550);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_overflow_2() {
     let limiter = RateLimiter::builder()
         .max(5)

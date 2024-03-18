@@ -1,7 +1,7 @@
 use leaky_bucket::RateLimiter;
-use std::time::{Duration, Instant};
+use tokio::time::{Duration, Instant};
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_issue5_a() {
     let limiter = RateLimiter::builder()
         .refill(1)
@@ -19,7 +19,7 @@ async fn test_issue5_a() {
     assert!((elapsed.as_secs_f64() - 1.).abs() < 0.1);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_issue5_b() {
     let limiter = RateLimiter::builder()
         .refill(1)

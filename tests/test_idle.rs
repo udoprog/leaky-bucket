@@ -4,7 +4,7 @@
 use leaky_bucket::RateLimiter;
 use tokio::time;
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_idle_1() {
     // We expect 20 seconds to pass, because sleeping prior to attempting to
     // acquire permits does not "accumulate" more permits and the first five
@@ -31,7 +31,7 @@ async fn test_idle_1() {
     assert!((elapsed.as_millis() as f32 - EXPECTED).abs() < 10.0);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_idle_2() {
     // We expect 2000 milliseconds to pass, because sleeping prior to
     // attempting to acquire permits does not "accumulate" more permits.
@@ -60,7 +60,7 @@ async fn test_idle_2() {
     assert!((elapsed.as_millis() as f32 - EXPECTED).abs() < 10.0);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_idle_3() {
     // We expect 100 milliseconds to pass, because the first five permits
     // acquired falls within one time window, which after 100 milliseconds rolls
