@@ -827,61 +827,81 @@ impl AcquireState {
 
     /// Access the completion flag.
     pub fn complete(&self) -> &AtomicBool {
-        // Safety: This is always safe to access since it's atomic.
+        // SAFETY: This is always safe to access since it's atomic.
         unsafe { &*ptr::addr_of!((*self.linking.get()).complete) }
     }
 
-    /// Get the underlying task.
-    pub unsafe fn task(&self) -> &Node<Task> {
-        &*ptr::addr_of!((*self.linking.get()).task)
-    }
-
     /// Get the underlying task mutably.
-    pub unsafe fn task_mut(&mut self) -> &mut Node<Task> {
-        &mut *ptr::addr_of_mut!((*self.linking.get()).task)
+    ///
+    /// We prove that the caller does indeed have mutable access to the node by
+    /// passing in a mutable reference to the critical section.
+    #[inline]
+    pub fn with_task_mut<F, O>(&mut self, critical: &mut Critical, f: F) -> O
+    where
+        F: FnOnce(&mut Critical, &mut Node<Task>) -> O,
+    {
+        // SAFETY: Caller has exclusive access to the critical section, since
+        // it's passed in as a mutable argument. We can also ensure that none of
+        // the borrows outlive the provided closure.
+        unsafe {
+            let task = &mut *ptr::addr_of_mut!((*self.linking.get()).task);
+            f(critical, task)
+        }
     }
 
-    /// Get the underlying task mutably and completion flag as a pair.
-    pub unsafe fn update_project(&mut self) -> (&mut Node<Task>, &AtomicBool, &mut bool) {
-        let node = self.linking.get();
-        let complete = &*ptr::addr_of!((*node).complete);
-        let node = &mut *ptr::addr_of_mut!((*node).task);
-        (node, complete, &mut self.linked)
+    /// Get the underlying task, completion flag and linked boolean mutably.
+    ///
+    /// We prove that the caller does indeed have mutable access to the node by
+    /// passing in a mutable reference to the critical section.
+    #[inline]
+    pub fn with_task_extra_mut<F>(&mut self, critical: &mut Critical, f: F)
+    where
+        F: FnOnce(&mut Critical, &mut Node<Task>, &AtomicBool, &mut bool),
+    {
+        // SAFETY: Caller has exclusive access to the critical section, since
+        // it's passed in as a mutable argument. We can also ensure that none of
+        // the borrows outlive the provided closure.
+        unsafe {
+            let node = self.linking.get();
+            let task = &mut *ptr::addr_of_mut!((*node).task);
+            let complete = &*ptr::addr_of!((*node).complete);
+            f(critical, task, complete, &mut self.linked);
+        }
     }
 
     /// Update the waiting state for this acquisition task. This might require
     /// that we update the associated waker.
     #[tracing::instrument(skip(self, critical, waker), level = "trace")]
     fn update(&mut self, critical: &mut MutexGuard<'_, Critical>, waker: &Waker) {
-        // Safety: we're ensured to do this under the critical lock since we've
-        // passed the relevant guard in through `waiters`.
-        let (task, complete, linked) = unsafe { self.update_project() };
+        self.with_task_extra_mut(critical, |critical, task, complete, linked| {
+            if !*linked {
+                trace!("linking self");
+                *linked = true;
 
-        if !*linked {
-            trace!("linking self");
-            *linked = true;
-
-            unsafe {
-                critical.waiters.push_front(task.into());
+                // SAFETY: We have a mutable reference to the critical section,
+                // so exclusive access is guaranteed.
+                unsafe {
+                    critical.waiters.push_front(task.into());
+                }
             }
-        }
 
-        let w = &mut task.waker;
+            let w = &mut task.waker;
 
-        let new_waker = match w {
-            None => true,
-            Some(w) => !w.will_wake(waker),
-        };
+            let new_waker = match w {
+                None => true,
+                Some(w) => !w.will_wake(waker),
+            };
 
-        if new_waker {
-            trace!("updating waker");
-            *w = Some(waker.clone());
-        }
+            if new_waker {
+                trace!("updating waker");
+                *w = Some(waker.clone());
+            }
 
-        if task.complete.is_none() {
-            trace!("setting complete");
-            task.complete = Some(complete.into());
-        }
+            if task.complete.is_none() {
+                trace!("setting complete");
+                task.complete = Some(complete.into());
+            }
+        });
     }
 
     /// Ensure that the current core task is correctly linked up if needed.
@@ -891,7 +911,9 @@ impl AcquireState {
             // Fair scheduling needs to ensure that the core is part of the wait
             // queue, and will be woken up in-order with other tasks.
             if !mem::replace(&mut self.linked, true) {
-                critical.waiters.push_front(self.task_mut().into());
+                self.with_task_mut(critical, |critical, task| {
+                    critical.waiters.push_front(task.into());
+                });
             }
         } else {
             // Unfair scheduling the core task is not supposed to be in the wait
@@ -899,7 +921,9 @@ impl AcquireState {
             // Ensure that the current task is *not* linked since it is now to
             // become the coordinator for everyone else.
             if mem::take(&mut self.linked) {
-                critical.waiters.remove(self.task_mut().into());
+                self.with_task_mut(critical, |critical, task| {
+                    critical.waiters.remove(task.into());
+                });
             }
         }
     }
@@ -912,7 +936,9 @@ impl AcquireState {
         lim: &RateLimiter,
     ) {
         if mem::take(&mut self.linked) {
-            critical.waiters.remove(self.task_mut().into());
+            self.with_task_mut(critical, |critical, task| {
+                critical.waiters.remove(task.into());
+            });
         }
 
         // Hand back permits which we've acquired so far.
@@ -1002,10 +1028,7 @@ impl AcquireState {
 
             // We only need to check the state since the current core holder is
             // linked up to the wait queue.
-            //
-            // Safety: we're doing this under the critical lock so we know we
-            // have exclusive access to the node.
-            if unsafe { self.task().is_completed() } {
+            if self.with_task_mut(critical, |_, task| task.is_completed()) {
                 // Task was unlinked by the drain action.
                 self.linked = false;
                 return true;
@@ -1022,12 +1045,10 @@ impl AcquireState {
             // remaining tokens from linked nodes, drain it from ourselves. We
             // fill the current holder of the core last (self). To ensure that
             // it stays around for as long as possible.
-            //
-            // Safety: we know that no one else holds the task at this point.
-            // The in particular the task is not linked into the wait queue.
-            let c = unsafe { self.task_mut() };
-            c.fill(&mut critical.balance);
-            c.is_completed()
+            self.with_task_mut(critical, |critical, task| {
+                task.fill(&mut critical.balance);
+                task.is_completed()
+            })
         }
     }
 
@@ -1271,12 +1292,14 @@ where
 
                     let balance = mem::take(&mut critical.balance);
 
+                    let remaining = this.permits - balance;
+
                     // Safety: This is done in a pinned section, so we know that
                     // the linked section stays alive for the duration of this
                     // future due to pinning guarantees.
-                    unsafe {
-                        this.internal.task_mut().remaining = this.permits - balance;
-                    }
+                    this.internal.with_task_mut(&mut critical, |_, task| {
+                        task.remaining = remaining;
+                    });
 
                     // Try to take over as core. If we're unsuccessful we just
                     // ensure that we're linked into the wait queue.
