@@ -35,30 +35,29 @@
 //! use leaky_bucket::RateLimiter;
 //! use tokio::time;
 //!
-//! #[tokio::main(flavor="current_thread",start_paused=true)]
-//! async fn main() {
-//!     let limiter = RateLimiter::builder()
-//!         .max(10)
-//!         .initial(0)
-//!         .refill(5)
-//!         .build();
+//! # #[tokio::main(flavor="current_thread", start_paused=true)] async fn main() {
+//! let limiter = RateLimiter::builder()
+//!     .max(10)
+//!     .initial(0)
+//!     .refill(5)
+//!     .build();
 //!
-//!     let start = time::Instant::now();
+//! let start = time::Instant::now();
 //!
-//!     println!("Waiting for permit...");
+//! println!("Waiting for permit...");
 //!
-//!     // Should take ~400 ms to acquire in total.
-//!     let a = limiter.acquire(7);
-//!     let b = limiter.acquire(3);
-//!     let c = limiter.acquire(10);
+//! // Should take ~400 ms to acquire in total.
+//! let a = limiter.acquire(7);
+//! let b = limiter.acquire(3);
+//! let c = limiter.acquire(10);
 //!
-//!     let ((), (), ()) = tokio::join!(a, b, c);
+//! let ((), (), ()) = tokio::join!(a, b, c);
 //!
-//!     println!(
-//!         "I made it in {:?}!",
-//!         time::Instant::now().duration_since(start)
-//!     );
-//! }
+//! println!(
+//!     "I made it in {:?}!",
+//!     time::Instant::now().duration_since(start)
+//! );
+//! # }
 //! ```
 //!
 //! <br>
@@ -78,7 +77,7 @@
 //! use leaky_bucket::RateLimiter;
 //! use std::time;
 //!
-//! # #[tokio::main(flavor="current_thread",start_paused=true)] async fn main() {
+//! # #[tokio::main(flavor="current_thread", start_paused=true)] async fn main() {
 //! let limiter = RateLimiter::builder()
 //!     .initial(10)
 //!     .interval(time::Duration::from_millis(100))
@@ -114,7 +113,7 @@
 //! > cargo run --example block-forever
 //! > ```
 //!
-//! ```
+//! ```no_run
 //! use leaky_bucket::RateLimiter;
 //! use std::future::Future;
 //! use std::sync::Arc;
@@ -123,7 +122,7 @@
 //! struct Waker;
 //! # impl std::task::Wake for Waker { fn wake(self: Arc<Self>) { } }
 //!
-//! # #[tokio::main(flavor="current_thread",start_paused=true)] async fn main() {
+//! # #[tokio::main(flavor="current_thread", start_paused=true)] async fn main() {
 //! let limiter = Arc::new(RateLimiter::builder().build());
 //!
 //! let waker = Arc::new(Waker).into();
@@ -444,7 +443,7 @@ impl RateLimiter {
     /// ```
     /// use leaky_bucket::RateLimiter;
     ///
-    /// # #[tokio::main(flavor="current_thread",start_paused=true)] async fn main() {
+    /// # #[tokio::main(flavor="current_thread", start_paused=true)] async fn main() {
     /// let limiter = RateLimiter::builder()
     ///     .initial(100)
     ///     .build();
@@ -465,7 +464,7 @@ impl RateLimiter {
     /// ```
     /// use leaky_bucket::RateLimiter;
     ///
-    /// # #[tokio::main(flavor="current_thread",start_paused=true)] async fn main() {
+    /// # #[tokio::main(flavor="current_thread", start_paused=true)] async fn main() {
     /// let limiter = RateLimiter::builder()
     ///     .initial(10)
     ///     .build();
@@ -488,7 +487,7 @@ impl RateLimiter {
     /// ```
     /// use leaky_bucket::RateLimiter;
     ///
-    /// # #[tokio::main(flavor="current_thread",start_paused=true)] async fn main() {
+    /// # #[tokio::main(flavor="current_thread", start_paused=true)] async fn main() {
     /// let limiter = RateLimiter::builder()
     ///     .initial(10)
     ///     .build();
@@ -515,7 +514,7 @@ impl RateLimiter {
     /// use leaky_bucket::RateLimiter;
     /// use std::sync::Arc;
     ///
-    /// # #[tokio::main(flavor="current_thread",start_paused=true)] async fn main() {
+    /// # #[tokio::main(flavor="current_thread", start_paused=true)] async fn main() {
     /// let limiter = Arc::new(RateLimiter::builder().initial(10).build());
     ///
     /// limiter.acquire_owned(10).await;
@@ -559,7 +558,7 @@ impl RateLimiter {
     ///     }
     /// }
     ///
-    /// # #[tokio::main(flavor="current_thread",start_paused=true)] async fn main() {
+    /// # #[tokio::main(flavor="current_thread", start_paused=true)] async fn main() {
     /// let limiter = Arc::new(RateLimiter::builder().initial(100).build());
     ///
     /// let future = MyFuture { limiter, acquire: None };
@@ -1097,7 +1096,7 @@ impl Acquire<'_> {
     /// struct Waker;
     /// # impl std::task::Wake for Waker { fn wake(self: Arc<Self>) { } }
     ///
-    /// # #[tokio::main(flavor="current_thread",start_paused=true)] async fn main() {
+    /// # #[tokio::main(flavor="current_thread", start_paused=true)] async fn main() {
     /// let limiter = RateLimiter::builder().build();
     ///
     /// let waker = Arc::new(Waker).into();
@@ -1148,7 +1147,7 @@ impl AcquireOwned {
     /// struct Waker;
     /// # impl std::task::Wake for Waker { fn wake(self: Arc<Self>) { } }
     ///
-    /// # #[tokio::main(flavor="current_thread",start_paused=true)] async fn main() {
+    /// # #[tokio::main(flavor="current_thread", start_paused=true)] async fn main() {
     /// let limiter = Arc::new(RateLimiter::builder().build());
     ///
     /// let waker = Arc::new(Waker).into();
