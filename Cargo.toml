@@ -17,6 +17,7 @@ categories = ["algorithms", "concurrency", "network-programming"]
 parking_lot = "0.12.1"
 tokio = { version = "1.28.1", features = ["time"] }
 tracing = { version = "0.1.37", default-features = false, features = ["attributes"] }
+pin-project-lite = "0.2"
 
 [dev-dependencies]
 anyhow = "1.0.71"
