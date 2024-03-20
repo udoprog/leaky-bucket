@@ -218,7 +218,6 @@ use core::marker;
 use core::mem;
 use core::pin::Pin;
 use core::ptr;
-use core::ptr::addr_of;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, Waker};
 
@@ -829,30 +828,24 @@ impl AcquireState {
     /// Access the completion flag.
     pub fn complete(&self) -> &AtomicBool {
         // Safety: This is always safe to access since it's atomic.
-        unsafe {
-            let ptr = addr_of!((*self.linking.get()).complete);
-            &*ptr
-        }
+        unsafe { &*ptr::addr_of!((*self.linking.get()).complete) }
     }
 
     /// Get the underlying task.
     pub unsafe fn task(&self) -> &Node<Task> {
-        unsafe {
-            let ptr = addr_of!((*self.linking.get()).task);
-            &*ptr
-        }
+        &*ptr::addr_of!((*self.linking.get()).task)
     }
 
     /// Get the underlying task mutably.
-    pub fn task_mut(&mut self) -> &mut Node<Task> {
-        &mut self.linking.get_mut().task
+    pub unsafe fn task_mut(&mut self) -> &mut Node<Task> {
+        &mut *ptr::addr_of_mut!((*self.linking.get()).task)
     }
 
     /// Get the underlying task mutably and completion flag as a pair.
-    pub fn update_project(&mut self) -> (&mut Node<Task>, &AtomicBool, &mut bool) {
-        let node = self.linking.get_mut();
-        let complete = &node.complete;
-        let node = &mut node.task;
+    pub unsafe fn update_project(&mut self) -> (&mut Node<Task>, &AtomicBool, &mut bool) {
+        let node = self.linking.get();
+        let complete = &*ptr::addr_of!((*node).complete);
+        let node = &mut *ptr::addr_of_mut!((*node).task);
         (node, complete, &mut self.linked)
     }
 
@@ -862,7 +855,7 @@ impl AcquireState {
     fn update(&mut self, critical: &mut MutexGuard<'_, Critical>, waker: &Waker) {
         // Safety: we're ensured to do this under the critical lock since we've
         // passed the relevant guard in through `waiters`.
-        let (task, complete, linked) = self.update_project();
+        let (task, complete, linked) = unsafe { self.update_project() };
 
         if !*linked {
             trace!("linking self");
@@ -1032,7 +1025,7 @@ impl AcquireState {
             //
             // Safety: we know that no one else holds the task at this point.
             // The in particular the task is not linked into the wait queue.
-            let c = self.task_mut();
+            let c = unsafe { self.task_mut() };
             c.fill(&mut critical.balance);
             c.is_completed()
         }
