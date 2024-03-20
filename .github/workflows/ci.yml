@@ -45,3 +45,12 @@ jobs:
       with:
         components: rustfmt
     - run: cargo fmt --check --all
+
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@nightly
+      with:
+        components: miri
+    - run: cargo miri test --workspace
