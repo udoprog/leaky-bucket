@@ -35,7 +35,7 @@ unsafe impl<T> Sync for Node<T> where T: Sync {}
 
 impl<T> Node<T> {
     /// Construct a new unlinked node.
-    pub const fn new(value: T) -> Self {
+    pub(crate) const fn new(value: T) -> Self {
         Self {
             pointers: UnsafeCell::new(Pointers {
                 next: None,
@@ -65,6 +65,7 @@ impl<T> Node<T> {
     }
 
     /// Take the next node.
+    #[cfg(test)]
     unsafe fn take_next(&mut self) -> Option<ptr::NonNull<Self>> {
         let ptr = self.pointers.get() as *mut Option<ptr::NonNull<Self>>;
         ptr::replace(ptr, None)
@@ -121,7 +122,7 @@ pub struct LinkedList<T> {
 
 impl<T> LinkedList<T> {
     /// Construct a new empty list.
-    pub const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             head: None,
             tail: None,
@@ -142,35 +143,8 @@ impl<T> LinkedList<T> {
     ///
     /// The caller also must ensure that the data pushed doesn't outlive its
     /// use.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::ptr;
-    /// use leaky_bucket::linked_list::{Node, LinkedList};
-    ///
-    /// let mut list = LinkedList::new();
-    ///
-    /// let mut a = Node::new(0);
-    /// let mut b = Node::new(0);
-    ///
-    /// unsafe {
-    ///     list.push_front(ptr::NonNull::from(&mut a));
-    ///     list.push_front(ptr::NonNull::from(&mut b));
-    ///
-    ///     let mut n = 1;
-    ///
-    ///     while let Some(mut last) = list.pop_back() {
-    ///         **last.as_mut() += n;
-    ///         n <<= 1;
-    ///     }
-    /// }
-    ///
-    /// assert_eq!(*a, 1);
-    /// assert_eq!(*b, 2);
-    /// ```
     #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace"))]
-    pub unsafe fn push_front(&mut self, mut node: ptr::NonNull<Node<T>>) {
+    pub(crate) unsafe fn push_front(&mut self, mut node: ptr::NonNull<Node<T>>) {
         debug_assert!(node.as_ref().next().is_none());
         debug_assert!(node.as_ref().prev().is_none());
 
@@ -198,35 +172,8 @@ impl<T> LinkedList<T> {
     ///
     /// The caller also must ensure that the data pushed doesn't outlive its
     /// use.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::ptr;
-    /// use leaky_bucket::linked_list::{Node, LinkedList};
-    ///
-    /// let mut list = LinkedList::new();
-    ///
-    /// let mut a = Node::new(0);
-    /// let mut b = Node::new(0);
-    ///
-    /// unsafe {
-    ///     list.push_back(ptr::NonNull::from(&mut a));
-    ///     list.push_back(ptr::NonNull::from(&mut b));
-    ///
-    ///     let mut n = 1;
-    ///
-    ///     while let Some(mut last) = list.pop_back() {
-    ///         **last.as_mut() += n;
-    ///         n <<= 1;
-    ///     }
-    /// }
-    ///
-    /// assert_eq!(*a, 2);
-    /// assert_eq!(*b, 1);
-    /// ```
     #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace"))]
-    pub unsafe fn push_back(&mut self, mut node: ptr::NonNull<Node<T>>) {
+    pub(crate) unsafe fn push_back(&mut self, mut node: ptr::NonNull<Node<T>>) {
         trace!(head = ?self.head, tail = ?self.tail, node = ?node, "push_back");
 
         debug_assert!(node.as_ref().next().is_none());
@@ -242,36 +189,9 @@ impl<T> LinkedList<T> {
         }
     }
 
-    /// Pop the front element from the list.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::ptr;
-    /// use leaky_bucket::linked_list::{Node, LinkedList};
-    ///
-    /// let mut list = LinkedList::new();
-    ///
-    /// let mut a = Node::new(0);
-    /// let mut b = Node::new(0);
-    ///
-    /// unsafe {
-    ///     list.push_back(ptr::NonNull::from(&mut a));
-    ///     list.push_back(ptr::NonNull::from(&mut b));
-    ///
-    ///     let mut n = 1;
-    ///
-    ///     while let Some(mut last) = list.pop_front() {
-    ///         **last.as_mut() += n;
-    ///         n <<= 1;
-    ///     }
-    /// }
-    ///
-    /// assert_eq!(*a, 1);
-    /// assert_eq!(*b, 2);
-    /// ```
+    #[cfg(test)]
     #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace"))]
-    pub unsafe fn pop_front(&mut self) -> Option<ptr::NonNull<Node<T>>> {
+    unsafe fn pop_front(&mut self) -> Option<ptr::NonNull<Node<T>>> {
         trace!(head = ?self.head, tail = ?self.tail, "pop_front");
 
         let mut head = self.head?;
@@ -292,35 +212,8 @@ impl<T> LinkedList<T> {
     }
 
     /// Pop the back element from the list.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::ptr;
-    /// use leaky_bucket::linked_list::{Node, LinkedList};
-    ///
-    /// let mut list = LinkedList::new();
-    ///
-    /// let mut a = Node::new(0);
-    /// let mut b = Node::new(0);
-    ///
-    /// unsafe {
-    ///     list.push_back(ptr::NonNull::from(&mut a));
-    ///     list.push_back(ptr::NonNull::from(&mut b));
-    ///
-    ///     let mut n = 1;
-    ///
-    ///     while let Some(mut last) = list.pop_back() {
-    ///         **last.as_mut() += n;
-    ///         n <<= 1;
-    ///     }
-    /// }
-    ///
-    /// assert_eq!(*a, 2);
-    /// assert_eq!(*b, 1);
-    /// ```
     #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace"))]
-    pub unsafe fn pop_back(&mut self) -> Option<ptr::NonNull<Node<T>>> {
+    pub(crate) unsafe fn pop_back(&mut self) -> Option<ptr::NonNull<Node<T>>> {
         trace!(head = ?self.head, tail = ?self.tail, "pop_back");
 
         let mut tail = self.tail?;
@@ -341,44 +234,8 @@ impl<T> LinkedList<T> {
     }
 
     /// Remove the specified node.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::ptr;
-    /// use leaky_bucket::linked_list::{Node, LinkedList};
-    ///
-    /// let mut list = LinkedList::new();
-    ///
-    /// let mut a = Node::new(0);
-    /// let mut b = Node::new(0);
-    /// let mut c = Node::new(0);
-    /// let mut d = Node::new(0);
-    ///
-    /// unsafe {
-    ///     list.push_back(ptr::NonNull::from(&mut a));
-    ///     list.push_back(ptr::NonNull::from(&mut b));
-    ///     list.push_back(ptr::NonNull::from(&mut c));
-    ///     list.push_back(ptr::NonNull::from(&mut d));
-    ///
-    ///     list.remove(ptr::NonNull::from(&mut b));
-    ///     list.remove(ptr::NonNull::from(&mut d));
-    ///
-    ///     let mut n = 1;
-    ///
-    ///     while let Some(mut last) = list.pop_back() {
-    ///         **last.as_mut() += n;
-    ///         n <<= 1;
-    ///     }
-    /// }
-    ///
-    /// assert_eq!(*a, 2);
-    /// assert_eq!(*b, 0);
-    /// assert_eq!(*c, 1);
-    /// assert_eq!(*d, 0);
-    /// ```
     #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace"))]
-    pub unsafe fn remove(&mut self, mut node: ptr::NonNull<Node<T>>) {
+    pub(crate) unsafe fn remove(&mut self, mut node: ptr::NonNull<Node<T>>) {
         trace!(head = ?self.head, tail = ?self.tail, node = ?node, "remove");
 
         let (next, prev) = node.as_mut().take_pair();
@@ -402,35 +259,8 @@ impl<T> LinkedList<T> {
     ///
     /// This returns a raw pointer which can correctly be mutably accessed since
     /// the signature of this method ensures exclusive access to the list.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::ptr;
-    /// use leaky_bucket::linked_list::{Node, LinkedList};
-    ///
-    /// let mut list = LinkedList::new();
-    ///
-    /// let mut a = Node::new(0);
-    ///
-    /// unsafe {
-    ///     list.push_back(ptr::NonNull::from(&mut a));
-    ///
-    ///     let mut n = 1;
-    ///
-    ///     if let Some(mut node) = list.front_mut() {
-    ///         **node.as_mut() += n;
-    ///         n <<= 1;
-    ///     }
-    ///
-    ///     assert_eq!(list.pop_front(), Some(ptr::NonNull::from(&mut a)));
-    ///     assert!(list.front_mut().is_none());
-    /// }
-    ///
-    /// assert_eq!(*a, 1);
-    /// ```
     #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace"))]
-    pub unsafe fn front_mut(&mut self) -> Option<ptr::NonNull<Node<T>>> {
+    pub(crate) unsafe fn front_mut(&mut self) -> Option<ptr::NonNull<Node<T>>> {
         self.head
     }
 }
@@ -455,5 +285,138 @@ impl<T> ops::Deref for Node<T> {
 impl<T> ops::DerefMut for Node<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.value
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ptr;
+
+    use super::*;
+
+    #[test]
+    fn push_back() {
+        let mut list = LinkedList::new();
+
+        let mut a = Node::new(0);
+        let mut b = Node::new(0);
+
+        unsafe {
+            list.push_back(ptr::NonNull::from(&mut a));
+            list.push_back(ptr::NonNull::from(&mut b));
+
+            let mut n = 1;
+
+            while let Some(mut last) = list.pop_back() {
+                **last.as_mut() += n;
+                n <<= 1;
+            }
+        }
+
+        assert_eq!(*a, 2);
+        assert_eq!(*b, 1);
+    }
+
+    #[test]
+    fn push_front() {
+        let mut list = LinkedList::new();
+
+        let mut a = Node::new(0);
+        let mut b = Node::new(0);
+
+        unsafe {
+            list.push_front(ptr::NonNull::from(&mut a));
+            list.push_front(ptr::NonNull::from(&mut b));
+
+            let mut n = 1;
+
+            while let Some(mut last) = list.pop_back() {
+                **last.as_mut() += n;
+                n <<= 1;
+            }
+        }
+
+        assert_eq!(*a, 1);
+        assert_eq!(*b, 2);
+    }
+
+    #[test]
+    fn remove() {
+        let mut list = LinkedList::new();
+
+        let mut a = Node::new(0);
+        let mut b = Node::new(0);
+        let mut c = Node::new(0);
+        let mut d = Node::new(0);
+
+        unsafe {
+            list.push_back(ptr::NonNull::from(&mut a));
+            list.push_back(ptr::NonNull::from(&mut b));
+            list.push_back(ptr::NonNull::from(&mut c));
+            list.push_back(ptr::NonNull::from(&mut d));
+
+            list.remove(ptr::NonNull::from(&mut b));
+            list.remove(ptr::NonNull::from(&mut d));
+
+            let mut n = 1;
+
+            while let Some(mut last) = list.pop_back() {
+                **last.as_mut() += n;
+                n <<= 1;
+            }
+        }
+
+        assert_eq!(*a, 2);
+        assert_eq!(*b, 0);
+        assert_eq!(*c, 1);
+        assert_eq!(*d, 0);
+    }
+
+    #[test]
+    fn front_mut() {
+        let mut list = LinkedList::new();
+
+        let mut a = Node::new(0);
+        let mut b = Node::new(1);
+
+        unsafe {
+            list.push_back(ptr::NonNull::from(&mut a));
+            list.push_back(ptr::NonNull::from(&mut b));
+
+            let mut n = 1;
+
+            while let Some(mut node) = list.pop_front() {
+                **node.as_mut() += n;
+                n <<= 1;
+            }
+
+            assert!(list.front_mut().is_none());
+        }
+
+        assert_eq!(*a, 1);
+        assert_eq!(*b, 3);
+    }
+
+    #[test]
+    fn pop_back() {
+        let mut list = LinkedList::new();
+
+        let mut a = Node::new(0);
+        let mut b = Node::new(0);
+
+        unsafe {
+            list.push_back(ptr::NonNull::from(&mut a));
+            list.push_back(ptr::NonNull::from(&mut b));
+
+            let mut n = 1;
+
+            while let Some(mut last) = list.pop_back() {
+                **last.as_mut() += n;
+                n <<= 1;
+            }
+        }
+
+        assert_eq!(*a, 2);
+        assert_eq!(*b, 1);
     }
 }
