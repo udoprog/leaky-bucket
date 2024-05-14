@@ -225,7 +225,18 @@ use alloc::sync::Arc;
 
 use parking_lot::{Mutex, MutexGuard};
 use tokio::time;
-use tracing::trace;
+
+#[cfg(feature = "tracing")]
+macro_rules! trace {
+    ($($arg:tt)*) => {
+        tracing::trace!($($arg)*)
+    };
+}
+
+#[cfg(not(feature = "tracing"))]
+macro_rules! trace {
+    ($($arg:tt)*) => {};
+}
 
 #[doc(hidden)]
 pub mod linked_list;
@@ -299,7 +310,7 @@ struct Critical {
 impl Critical {
     /// Release the current core. Beyond this point the current task may no
     /// longer interact exclusively with the core.
-    #[tracing::instrument(skip(self), level = "trace")]
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip(self), level = "trace"))]
     fn release(&mut self) {
         trace!("releasing core");
         self.available = true;
@@ -787,22 +798,16 @@ impl Default for Builder {
 }
 
 /// The state of an acquire operation.
-#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, Copy)]
 enum State {
     /// Initial unconfigured state.
     Initial,
     /// The acquire is waiting to be released by the core.
     Waiting,
-    /// This operation is currently the core.
-    ///
-    /// We need to take care to ensure that we don't move the configured sleep.
-    /// Since it needs to be pinned to be polled.
-    Core {
-        /// The current sleep of the core.
-        sleep: time::Sleep,
-    },
     /// The operation is completed.
     Complete,
+    /// The task is currently the core.
+    Core,
 }
 
 /// Internal state of the acquire. This is separated because it can be computed
@@ -871,7 +876,10 @@ impl AcquireState {
 
     /// Update the waiting state for this acquisition task. This might require
     /// that we update the associated waker.
-    #[tracing::instrument(skip(self, critical, waker), level = "trace")]
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip(self, critical, waker), level = "trace")
+    )]
     fn update(&mut self, critical: &mut MutexGuard<'_, Critical>, waker: &Waker) {
         self.with_task_extra_mut(critical, |critical, task, complete, linked| {
             if !*linked {
@@ -905,7 +913,10 @@ impl AcquireState {
     }
 
     /// Ensure that the current core task is correctly linked up if needed.
-    #[tracing::instrument(skip(self, critical, lim), level = "trace")]
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip(self, critical, lim), level = "trace")
+    )]
     unsafe fn link_core(&mut self, critical: &mut Critical, lim: &RateLimiter) {
         if lim.fair {
             // Fair scheduling needs to ensure that the core is part of the wait
@@ -952,7 +963,10 @@ impl AcquireState {
     }
 
     /// Refill the wait queue with the given number of tokens.
-    #[tracing::instrument(skip(self, critical, lim), level = "trace")]
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip(self, critical, lim), level = "trace")
+    )]
     fn drain_wait_queue(
         &self,
         critical: &mut MutexGuard<'_, Critical>,
@@ -1011,7 +1025,10 @@ impl AcquireState {
 
     /// Drain the given number of tokens through the core. Returns `true` if the
     /// core has been completed.
-    #[tracing::instrument(skip(self, critical, tokens, lim), level = "trace")]
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip(self, critical, tokens, lim), level = "trace")
+    )]
     fn drain_core(
         &mut self,
         critical: &mut MutexGuard<'_, Critical>,
@@ -1059,7 +1076,10 @@ impl AcquireState {
     ///
     /// This might link the current task into the task queue, so the caller must
     /// ensure that it is pinned.
-    #[tracing::instrument(skip(self, critical, lim), level = "trace")]
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip(self, critical, lim), level = "trace")
+    )]
     unsafe fn assume_core(
         &mut self,
         critical: &mut MutexGuard<'_, Critical>,
@@ -1204,6 +1224,10 @@ where
     permits: usize,
     /// State of the acquisition.
     state: State,
+    /// Sleep associated with the future, if any.
+    ///
+    /// This is set if this future has ever been Core and needed to sleep.
+    sleep: Option<time::Sleep>,
     /// The internal acquire state.
     internal: AcquireState,
 }
@@ -1213,17 +1237,42 @@ where
     T: AsRef<RateLimiter>,
 {
     #[inline]
-    fn new(lim: T, permits: usize) -> Self {
+    const fn new(lim: T, permits: usize) -> Self {
         Self {
             lim,
             permits,
             state: State::Initial,
+            sleep: None,
             internal: AcquireState::INITIAL,
         }
     }
 
     fn is_core(&self) -> bool {
         matches!(&self.state, State::Core { .. })
+    }
+
+    #[inline]
+    fn project(
+        self: Pin<&mut Self>,
+    ) -> (
+        &RateLimiter,
+        usize,
+        &mut State,
+        Pin<&mut Option<time::Sleep>>,
+        &mut AcquireState,
+    ) {
+        // SAFETY: We're ensuring that what needs to be pinned, remains pinned.
+        unsafe {
+            let this = self.get_unchecked_mut();
+            let sleep = Pin::new_unchecked(&mut this.sleep);
+            (
+                this.lim.as_ref(),
+                this.permits,
+                &mut this.state,
+                sleep,
+                &mut this.internal,
+            )
+        }
     }
 }
 
@@ -1240,17 +1289,16 @@ where
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = unsafe { self.get_unchecked_mut() };
-        let lim = this.lim.as_ref();
+        let (lim, permits, state, mut sleep, internal) = self.project();
 
         loop {
-            match &mut this.state {
+            match state {
                 State::Initial => {
                     // Safety: The task is not linked up yet, so we can safely
                     // inspect the number of permits without having to
                     // synchronize.
-                    if this.permits == 0 {
-                        this.state = State::Complete;
+                    if permits == 0 {
+                        *state = State::Complete;
                         return Poll::Ready(());
                     }
 
@@ -1279,46 +1327,44 @@ where
                         // processes to observe that the deadline has been
                         // reached.
                         critical.deadline = deadline;
-                        this.internal.drain_wait_queue(&mut critical, tokens, lim);
+                        internal.drain_wait_queue(&mut critical, tokens, lim);
                     }
 
                     // Test the fast path first, where we simply subtract the
                     // permits available from the current balance.
-                    if let Some(balance) = critical.balance.checked_sub(this.permits) {
+                    if let Some(balance) = critical.balance.checked_sub(permits) {
                         critical.balance = balance;
-                        this.state = State::Complete;
+                        *state = State::Complete;
                         return Poll::Ready(());
                     }
 
                     let balance = mem::take(&mut critical.balance);
 
-                    let remaining = this.permits - balance;
+                    let remaining = permits - balance;
 
                     // Safety: This is done in a pinned section, so we know that
                     // the linked section stays alive for the duration of this
                     // future due to pinning guarantees.
-                    this.internal.with_task_mut(&mut critical, |_, task| {
+                    internal.with_task_mut(&mut critical, |_, task| {
                         task.remaining = remaining;
                     });
 
                     // Try to take over as core. If we're unsuccessful we just
                     // ensure that we're linked into the wait queue.
                     if !mem::take(&mut critical.available) {
-                        this.internal.update(&mut critical, cx.waker());
-                        this.state = State::Waiting;
+                        internal.update(&mut critical, cx.waker());
+                        *state = State::Waiting;
                         return Poll::Pending;
                     }
 
                     // Safety: This is done in a pinned section, so we know that
                     // the linked section stays alive for the duration of this
                     // future due to pinning guarantees.
-                    unsafe { this.internal.link_core(&mut critical, lim) };
+                    unsafe { internal.link_core(&mut critical, lim) };
 
                     trace!(until = ?critical.deadline, "taking over core and sleeping");
-                    this.state = State::Core {
-                        sleep: time::sleep_until(critical.deadline),
-                    };
-
+                    *state = State::Core;
+                    sleep.set(Some(time::sleep_until(critical.deadline)));
                     trace!("no immediate tokens available");
                 }
                 State::Waiting => {
@@ -1326,8 +1372,8 @@ where
                     //
                     // This field is atomic, so we can safely read it under shared
                     // access and do not require a lock.
-                    if this.internal.complete().load(Ordering::Acquire) {
-                        this.state = State::Complete;
+                    if internal.complete().load(Ordering::Acquire) {
+                        *state = State::Complete;
                         return Poll::Ready(());
                     }
 
@@ -1339,31 +1385,38 @@ where
                     // Try to take over as core. If we're unsuccessful we
                     // just ensure that we're linked into the wait queue.
                     if !mem::take(&mut critical.available) {
-                        this.internal.update(&mut critical, cx.waker());
+                        internal.update(&mut critical, cx.waker());
                         return Poll::Pending;
                     }
 
                     // Safety: This is done in a pinned section, so we know that
                     // the linked section stays alive for the duration of this
                     // future due to pinning guarantees.
-                    let assumed = unsafe { this.internal.assume_core(&mut critical, lim) };
+                    let assumed = unsafe { internal.assume_core(&mut critical, lim) };
 
                     if !assumed {
                         // Marks as completed.
-                        this.state = State::Complete;
+                        *state = State::Complete;
                         return Poll::Ready(());
                     }
 
                     trace!(until = ?critical.deadline, "taking over core and sleeping");
-                    this.state = State::Core {
-                        sleep: time::sleep_until(critical.deadline),
-                    };
-                }
-                State::Core { sleep } => {
-                    let mut sleep = unsafe { Pin::new_unchecked(sleep) };
+                    *state = State::Core;
 
-                    if sleep.as_mut().poll(cx).is_pending() {
-                        return Poll::Pending;
+                    match sleep.as_mut().as_pin_mut() {
+                        Some(sleep) => {
+                            sleep.reset(critical.deadline);
+                        }
+                        None => {
+                            sleep.set(Some(time::sleep_until(critical.deadline)));
+                        }
+                    }
+                }
+                State::Core => {
+                    if let Some(sleep) = sleep.as_mut().as_pin_mut() {
+                        if sleep.poll(cx).is_pending() {
+                            return Poll::Pending;
+                        }
                     }
 
                     let now = time::Instant::now();
@@ -1373,14 +1426,22 @@ where
 
                     // Safety: we know that we're the only one with access to core
                     // because we ensured it as we acquire the `available` lock.
-                    if this.internal.drain_core(&mut critical, lim.refill, lim) {
+                    if internal.drain_core(&mut critical, lim.refill, lim) {
                         critical.release();
-                        this.state = State::Complete;
+                        *state = State::Complete;
                         return Poll::Ready(());
                     }
 
                     trace!(sleep = ?lim.interval, "keeping core and sleeping");
-                    sleep.as_mut().reset(critical.deadline);
+
+                    match sleep.as_mut().as_pin_mut() {
+                        Some(sleep) => {
+                            sleep.reset(critical.deadline);
+                        }
+                        None => {
+                            sleep.set(Some(time::sleep_until(critical.deadline)));
+                        }
+                    }
                 }
                 State::Complete => {
                     panic!("polled after completion");

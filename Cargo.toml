@@ -13,10 +13,14 @@ license = "MIT OR Apache-2.0"
 keywords = ["async", "futures", "ratelimit", "throttle", "tokenbucket"]
 categories = ["algorithms", "concurrency", "network-programming"]
 
+[features]
+default = []
+tracing = ["dep:tracing"]
+
 [dependencies]
 parking_lot = "0.12.1"
 tokio = { version = "1.28.1", features = ["time"] }
-tracing = { version = "0.1.37", default-features = false, features = ["attributes"] }
+tracing = { version = "0.1.37", default-features = false, features = ["attributes"], optional = true }
 
 [dev-dependencies]
 anyhow = "1.0.71"
