@@ -1,6 +1,7 @@
-use anyhow::Result;
 use std::sync::Arc;
 use std::time::Duration;
+
+use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {

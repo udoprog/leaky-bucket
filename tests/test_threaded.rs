@@ -1,6 +1,7 @@
-use leaky_bucket::RateLimiter;
 use std::sync::Arc;
-use std::time::Duration;
+
+use leaky_bucket::RateLimiter;
+use tokio::time::Duration;
 
 #[tokio::test(start_paused = true)]
 async fn test_threaded() -> anyhow::Result<()> {

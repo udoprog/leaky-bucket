@@ -2,7 +2,7 @@
 //! https://github.com/Gelbpunkt/leaky-bucket-lite/blob/main/tests/test_overflow.rs
 
 use leaky_bucket::RateLimiter;
-use tokio::time;
+use tokio::time::{self, Duration};
 
 #[tokio::test(start_paused = true)]
 async fn test_overflow() {
@@ -10,7 +10,7 @@ async fn test_overflow() {
         .max(5)
         .initial(5)
         .refill(1)
-        .interval(time::Duration::from_millis(100))
+        .interval(Duration::from_millis(100))
         .build();
 
     let begin = time::Instant::now();
@@ -30,7 +30,7 @@ async fn test_overflow_2() {
         .max(5)
         .initial(5)
         .refill(1)
-        .interval(time::Duration::from_millis(100))
+        .interval(Duration::from_millis(100))
         .build();
 
     let begin = time::Instant::now();
