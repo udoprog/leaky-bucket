@@ -238,8 +238,7 @@ macro_rules! trace {
     ($($arg:tt)*) => {};
 }
 
-#[doc(hidden)]
-pub mod linked_list;
+mod linked_list;
 use self::linked_list::{LinkedList, Node};
 
 /// Default factor for how to calculate max refill value.
