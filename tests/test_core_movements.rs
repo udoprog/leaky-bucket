@@ -1,8 +1,9 @@
-use leaky_bucket::RateLimiter;
 use std::future::Future;
 use std::sync::Arc;
 use std::task::{Context, Wake};
-use std::time;
+
+use leaky_bucket::RateLimiter;
+use tokio::time::Duration;
 
 struct Waker;
 
@@ -13,7 +14,7 @@ impl Wake for Waker {
 #[tokio::test(start_paused = true)]
 async fn test_drop_core() {
     let limiter = RateLimiter::builder()
-        .interval(time::Duration::from_millis(50))
+        .interval(Duration::from_millis(50))
         .build();
 
     let waker = Arc::new(Waker).into();
@@ -46,7 +47,7 @@ async fn test_drop_core() {
 #[tokio::test(start_paused = true)]
 async fn test_core_move() {
     let limiter = RateLimiter::builder()
-        .interval(time::Duration::from_millis(50))
+        .interval(Duration::from_millis(50))
         .build();
 
     let waker = Arc::new(Waker).into();

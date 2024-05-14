@@ -1,5 +1,6 @@
-use leaky_bucket::RateLimiter;
 use std::time;
+
+use leaky_bucket::RateLimiter;
 
 #[tokio::main]
 async fn main() {

@@ -510,6 +510,74 @@ impl RateLimiter {
         Acquire(AcquireFut::new(BorrowedRateLimiter(self), permits))
     }
 
+    /// Try to acquire the given number of permits, returning `true` if the
+    /// given number of permits can be immediately acquired.
+    ///
+    /// If the scheduler is fair, and there are pending tasks waiting to acquire
+    /// tokens this method will return `false`.
+    ///
+    /// If zero permits are specified, this method returns `Ok(())`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use leaky_bucket::RateLimiter;
+    ///
+    /// # #[tokio::main(flavor="current_thread", start_paused=true)] async fn main() {
+    /// let limiter = RateLimiter::builder().refill(1).initial(1).build();
+    ///
+    /// assert!(limiter.try_acquire(1));
+    /// assert!(!limiter.try_acquire(1));
+    ///
+    /// tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    ///
+    /// assert!(limiter.try_acquire(1));
+    /// assert!(limiter.try_acquire(1));
+    /// assert!(!limiter.try_acquire(1));
+    /// # }
+    /// ```
+    pub fn try_acquire(&self, permits: usize) -> bool {
+        let mut critical = self.critical.lock();
+
+        if self.fair && (!critical.available || !critical.waiters.is_empty()) {
+            return false;
+        }
+
+        dbg!(critical.balance, permits);
+
+        if critical.balance >= permits {
+            critical.balance -= permits;
+            return true;
+        }
+
+        // Here we try to assume core duty temporarily to see if we can release
+        // a sufficient number of tokens to allow the current task to proceed.
+
+        // The core is *not* available, which also implies that there are tasks
+        // ahead which are busy.
+        if !critical.available {
+            return false;
+        }
+
+        if let Some((tokens, deadline)) = self.calculate_drain(critical.deadline) {
+            critical.balance = critical.balance.saturating_add(tokens);
+            critical.deadline = deadline;
+        }
+
+        let acquired = if critical.balance >= permits {
+            critical.balance -= permits;
+            true
+        } else {
+            false
+        };
+
+        if critical.balance > self.max {
+            critical.balance = self.max;
+        }
+
+        acquired
+    }
+
     /// Acquire a permit using an owned future.
     ///
     /// If zero permits are specified, this function never suspends the current
@@ -578,6 +646,32 @@ impl RateLimiter {
     /// ```
     pub fn acquire_owned(self: Arc<Self>, permits: usize) -> AcquireOwned {
         AcquireOwned(AcquireFut::new(self, permits))
+    }
+
+    /// Calculate refill amount. Returning a tuple of how much to fill and remaining
+    /// duration to sleep until the next refill time if appropriate.
+    fn calculate_drain(&self, deadline: time::Instant) -> Option<(usize, time::Instant)> {
+        let now = time::Instant::now();
+
+        if now < deadline {
+            return None;
+        }
+
+        // Time elapsed in milliseconds since the last deadline.
+        let millis = self.interval.as_millis();
+        let since = now.saturating_duration_since(deadline).as_millis();
+
+        let periods = usize::try_from(since / millis + 1).unwrap_or(usize::MAX);
+        let tokens = periods.checked_mul(self.refill).unwrap_or(usize::MAX);
+
+        let rem = u64::try_from(since % millis).unwrap_or(u64::MAX);
+
+        // Calculated time remaining until the next deadline.
+        let deadline = now
+            + self
+                .interval
+                .saturating_sub(time::Duration::from_millis(rem));
+        Some((tokens, deadline))
     }
 }
 
@@ -717,10 +811,17 @@ impl Builder {
         self
     }
 
-    /// Configure the rate limiter to be fair. By default the rate limiter is
-    /// *fair* which ensures that all tasks make steady progress even under
-    /// contention. But an unfair scheduler might have a higher total
-    /// throughput.
+    /// Configure the rate limiter to be fair.
+    ///
+    /// Fairness is enabled by deafult.
+    ///
+    /// Fairness ensures that tasks make progress in the order that they acquire
+    /// even when the rate limiter is under contention. An unfair scheduler
+    /// might have a higher total throughput.
+    ///
+    /// Fair scheduling also affects the behavior of
+    /// [`RateLimiter::try_acquire`] which will return `false` if there are any
+    /// pending tasks since they should be given priority.
     ///
     /// # Examples
     ///
@@ -1078,7 +1179,7 @@ impl AcquireState {
     ) -> bool {
         self.link_core(critical, lim);
 
-        let (tokens, deadline) = match calculate_drain(critical.deadline, lim.interval) {
+        let (tokens, deadline) = match lim.calculate_drain(critical.deadline) {
             Some(tokens) => tokens,
             None => return true,
         };
@@ -1309,9 +1410,7 @@ where
                     // release a lot of acquires and accumulate permits.
                     //
                     // This is tested for in the `test_idle` suite of tests.
-                    if let Some((tokens, deadline)) =
-                        calculate_drain(critical.deadline, lim.interval)
-                    {
+                    if let Some((tokens, deadline)) = lim.calculate_drain(critical.deadline) {
                         trace!(tokens = tokens, "inline drain");
                         // We pre-emptively update the deadline of the core
                         // since it might bump, and we don't want other
@@ -1485,30 +1584,6 @@ struct Linking {
     /// Avoids noalias heuristics from kicking in on references to a `Linking`
     /// struct.
     _pin: marker::PhantomPinned,
-}
-
-/// Calculate refill amount. Returning a tuple of how much to fill and remaining
-/// duration to sleep until the next refill time if appropriate.
-fn calculate_drain(
-    deadline: time::Instant,
-    interval: time::Duration,
-) -> Option<(usize, time::Instant)> {
-    let now = time::Instant::now();
-
-    if now < deadline {
-        return None;
-    }
-
-    // Time elapsed in milliseconds since the last deadline.
-    let millis = interval.as_millis();
-    let since = now.saturating_duration_since(deadline).as_millis();
-
-    let tokens = usize::try_from(since / millis + 1).unwrap_or(usize::MAX);
-    let rem = u64::try_from(since % millis).unwrap_or(u64::MAX);
-
-    // Calculated time remaining until the next deadline.
-    let deadline = now + (interval - time::Duration::from_millis(rem));
-    Some((tokens, deadline))
 }
 
 #[cfg(test)]

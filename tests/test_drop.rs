@@ -1,10 +1,9 @@
 use std::pin::pin;
 use std::sync::Arc;
-use tokio::time::{Duration, Instant};
+use tokio::time::{self, Duration, Instant};
 
 use leaky_bucket::RateLimiter;
 use tokio::task::JoinSet;
-use tokio::time::sleep;
 
 #[tokio::test(start_paused = true)]
 async fn test_drop() -> anyhow::Result<()> {
@@ -32,7 +31,7 @@ async fn test_drop() -> anyhow::Result<()> {
     }
 
     tokio::select! {
-        _ = sleep(Duration::from_millis(1000)) => {
+        _ = time::sleep(Duration::from_millis(1000)) => {
             // Drop the task
             task.set(None);
         }

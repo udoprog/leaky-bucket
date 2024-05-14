@@ -1,7 +1,8 @@
-use leaky_bucket::RateLimiter;
 use std::future::Future;
 use std::sync::Arc;
 use std::task::Context;
+
+use leaky_bucket::RateLimiter;
 
 struct Waker;
 
