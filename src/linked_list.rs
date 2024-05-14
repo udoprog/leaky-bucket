@@ -46,6 +46,12 @@ impl<T> Node<T> {
         }
     }
 
+    /// Access the value in the node.
+    #[inline]
+    pub(crate) fn value(&self) -> &T {
+        &self.value
+    }
+
     /// Get the next node.
     unsafe fn next(&self) -> Option<ptr::NonNull<Self>> {
         let ptr = self.pointers.get() as *const _ as *const Option<ptr::NonNull<Self>>;

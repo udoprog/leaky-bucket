@@ -257,8 +257,9 @@ const BUMP_LIMIT: usize = 16;
 struct Task {
     /// Remaining tokens that need to be satisfied.
     remaining: usize,
-    /// Link to [Linking::complete].
-    complete: Option<ptr::NonNull<AtomicBool>>,
+    /// If this node has been released or not. We make this an atomic to permit
+    /// access to it without synchronization.
+    complete: AtomicBool,
     /// The waker associated with the node.
     waker: Option<Waker>,
 }
@@ -268,7 +269,7 @@ impl Task {
     const fn new() -> Self {
         Self {
             remaining: 0,
-            complete: None,
+            complete: AtomicBool::new(false),
             waker: None,
         }
     }
@@ -825,7 +826,6 @@ impl AcquireState {
         linked: false,
         linking: UnsafeCell::new(Linking {
             task: Node::new(Task::new()),
-            complete: AtomicBool::new(false),
             _pin: marker::PhantomPinned,
         }),
     };
@@ -833,7 +833,7 @@ impl AcquireState {
     /// Access the completion flag.
     pub fn complete(&self) -> &AtomicBool {
         // SAFETY: This is always safe to access since it's atomic.
-        unsafe { &*ptr::addr_of!((*self.linking.get()).complete) }
+        unsafe { &*ptr::addr_of!((*self.linking.get()).task.value().complete) }
     }
 
     /// Get the underlying task mutably.
@@ -861,7 +861,7 @@ impl AcquireState {
     #[inline]
     pub fn with_task_extra_mut<F>(&mut self, critical: &mut Critical, f: F)
     where
-        F: FnOnce(&mut Critical, &mut Node<Task>, &AtomicBool, &mut bool),
+        F: FnOnce(&mut Critical, &mut Node<Task>, &mut bool),
     {
         // SAFETY: Caller has exclusive access to the critical section, since
         // it's passed in as a mutable argument. We can also ensure that none of
@@ -869,8 +869,7 @@ impl AcquireState {
         unsafe {
             let node = self.linking.get();
             let task = &mut *ptr::addr_of_mut!((*node).task);
-            let complete = &*ptr::addr_of!((*node).complete);
-            f(critical, task, complete, &mut self.linked);
+            f(critical, task, &mut self.linked);
         }
     }
 
@@ -881,7 +880,7 @@ impl AcquireState {
         tracing::instrument(skip(self, critical, waker), level = "trace")
     )]
     fn update(&mut self, critical: &mut MutexGuard<'_, Critical>, waker: &Waker) {
-        self.with_task_extra_mut(critical, |critical, task, complete, linked| {
+        self.with_task_extra_mut(critical, |critical, task, linked| {
             if !*linked {
                 trace!("linking self");
                 *linked = true;
@@ -903,11 +902,6 @@ impl AcquireState {
             if new_waker {
                 trace!("updating waker");
                 *w = Some(waker.clone());
-            }
-
-            if task.complete.is_none() {
-                trace!("setting complete");
-                task.complete = Some(complete.into());
             }
         });
     }
@@ -1001,9 +995,7 @@ impl AcquireState {
                     break;
                 }
 
-                if let Some(complete) = n.complete.take() {
-                    complete.as_ref().store(true, Ordering::Release);
-                }
+                n.complete.store(true, Ordering::Release);
 
                 if let Some(waker) = n.waker.take() {
                     waker.wake();
@@ -1491,9 +1483,6 @@ where
 struct Linking {
     /// The node in the linked list.
     task: Node<Task>,
-    /// If this node has been released or not. We make this an atomic to permit
-    /// access to it without synchronization.
-    complete: AtomicBool,
     /// Avoids noalias heuristics from kicking in on references to a `Linking`
     /// struct.
     _pin: marker::PhantomPinned,
