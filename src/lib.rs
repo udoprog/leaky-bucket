@@ -312,6 +312,26 @@ struct Critical {
 }
 
 impl Critical {
+    #[inline]
+    fn push_task(&mut self, task: &mut Node<Task>) {
+        // SAFETY: We both have mutable access to the node being pushed, and
+        // mutable access to the critical section through `self`. So we know we
+        // have exclusive tampering rights to the waiter queue.
+        unsafe {
+            self.waiters.push_back(task.into());
+        }
+    }
+
+    #[inline]
+    fn remove_task(&mut self, task: &mut Node<Task>) {
+        // SAFETY: We both have mutable access to the node being pushed, and
+        // mutable access to the critical section through `self`. So we know we
+        // have exclusive tampering rights to the waiter queue.
+        unsafe {
+            self.waiters.remove(task.into());
+        }
+    }
+
     /// Release the current core. Beyond this point the current task may no
     /// longer interact exclusively with the core.
     #[cfg_attr(feature = "tracing", tracing::instrument(skip(self), level = "trace"))]
@@ -323,11 +343,7 @@ impl Critical {
         // core status it will have to make sure it is no longer linked into the
         // wait queue.
         //
-        // We have to do this, because another task might miss that the core is
-        // available since it's hidden behind an atomic, so we wake any task up
-        // to ensure that it will always be picked up.
-        //
-        // Safety: We're holding the lock guard to all the waiters so we can be
+        // SAFETY: We're holding the lock guard to all the waiters so we can be
         // certain that we have exclusive access.
         unsafe {
             if let Some(mut node) = self.waiters.front_mut() {
@@ -566,7 +582,9 @@ impl RateLimiter {
             return false;
         }
 
-        if let Some((tokens, deadline)) = self.calculate_drain(critical.deadline) {
+        let now = Instant::now();
+
+        if let Some((tokens, deadline)) = self.calculate_drain(critical.deadline, now) {
             critical.balance = critical.balance.saturating_add(tokens);
             critical.deadline = deadline;
         }
@@ -657,9 +675,7 @@ impl RateLimiter {
 
     /// Calculate refill amount. Returning a tuple of how much to fill and remaining
     /// duration to sleep until the next refill time if appropriate.
-    fn calculate_drain(&self, deadline: Instant) -> Option<(usize, Instant)> {
-        let now = Instant::now();
-
+    fn calculate_drain(&self, deadline: Instant, now: Instant) -> Option<(usize, Instant)> {
         if now < deadline {
             return None;
         }
@@ -1018,13 +1034,13 @@ impl AcquireState {
         feature = "tracing",
         tracing::instrument(skip(self, critical, lim), level = "trace")
     )]
-    unsafe fn link_core(&mut self, critical: &mut Critical, lim: &RateLimiter) {
+    fn link_core(&mut self, critical: &mut Critical, lim: &RateLimiter) {
         if lim.fair {
             // Fair scheduling needs to ensure that the core is part of the wait
             // queue, and will be woken up in-order with other tasks.
             if !mem::replace(&mut self.linked, true) {
                 self.with_task_mut(critical, |critical, task| {
-                    critical.waiters.push_front(task.into());
+                    critical.push_task(task);
                 });
             }
         } else {
@@ -1034,14 +1050,14 @@ impl AcquireState {
             // become the coordinator for everyone else.
             if mem::take(&mut self.linked) {
                 self.with_task_mut(critical, |critical, task| {
-                    critical.waiters.remove(task.into());
+                    critical.remove_task(task);
                 });
             }
         }
     }
 
     /// Release any remaining tokens which are associated with this particular task.
-    unsafe fn release_remaining(
+    fn release_remaining(
         &mut self,
         critical: &mut MutexGuard<'_, Critical>,
         permits: usize,
@@ -1049,7 +1065,7 @@ impl AcquireState {
     ) {
         if mem::take(&mut self.linked) {
             self.with_task_mut(critical, |critical, task| {
-                critical.waiters.remove(task.into());
+                critical.remove_task(task);
             });
         }
 
@@ -1179,14 +1195,15 @@ impl AcquireState {
         feature = "tracing",
         tracing::instrument(skip(self, critical, lim), level = "trace")
     )]
-    unsafe fn assume_core(
+    fn assume_core(
         &mut self,
         critical: &mut MutexGuard<'_, Critical>,
         lim: &RateLimiter,
+        now: Instant,
     ) -> bool {
         self.link_core(critical, lim);
 
-        let (tokens, deadline) = match lim.calculate_drain(critical.deadline) {
+        let (tokens, deadline) = match lim.calculate_drain(critical.deadline, now) {
             Some(tokens) => tokens,
             None => return true,
         };
@@ -1390,161 +1407,157 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let (lim, permits, state, mut sleep, internal) = self.project();
 
-        loop {
-            match state {
-                State::Initial => {
-                    // Safety: The task is not linked up yet, so we can safely
-                    // inspect the number of permits without having to
-                    // synchronize.
-                    if permits == 0 {
-                        *state = State::Complete;
-                        return Poll::Ready(());
-                    }
+        let mut critical;
+        let now;
 
-                    let mut critical = lim.critical.lock();
-
-                    // If we've hit a deadline, calculate the number of tokens
-                    // to drain and perform it in line here. This is necessary
-                    // because the core isn't aware of how long we sleep between
-                    // each acquire, so we need to perform some of the drain
-                    // work here in order to avoid acruing a debt that needs to
-                    // be filled later in.
-                    //
-                    // If we didn't do this, and the process slept for a long
-                    // time, the next time a core is acquired it would be very
-                    // far removed from the expected deadline and has no idea
-                    // when permits were acquired, so it would over-eagerly
-                    // release a lot of acquires and accumulate permits.
-                    //
-                    // This is tested for in the `test_idle` suite of tests.
-                    if let Some((tokens, deadline)) = lim.calculate_drain(critical.deadline) {
-                        trace!(tokens = tokens, "inline drain");
-                        // We pre-emptively update the deadline of the core
-                        // since it might bump, and we don't want other
-                        // processes to observe that the deadline has been
-                        // reached.
-                        critical.deadline = deadline;
-                        internal.drain_wait_queue(&mut critical, tokens, lim);
-                    }
-
-                    // Test the fast path first, where we simply subtract the
-                    // permits available from the current balance.
-                    if let Some(balance) = critical.balance.checked_sub(permits) {
-                        critical.balance = balance;
-                        *state = State::Complete;
-                        return Poll::Ready(());
-                    }
-
-                    let balance = mem::take(&mut critical.balance);
-
-                    let remaining = permits - balance;
-
-                    // Safety: This is done in a pinned section, so we know that
-                    // the linked section stays alive for the duration of this
-                    // future due to pinning guarantees.
-                    internal.with_task_mut(&mut critical, |_, task| {
-                        task.remaining = remaining;
-                    });
-
-                    // Try to take over as core. If we're unsuccessful we just
-                    // ensure that we're linked into the wait queue.
-                    if !mem::take(&mut critical.available) {
-                        internal.update(&mut critical, cx.waker());
-                        *state = State::Waiting;
-                        return Poll::Pending;
-                    }
-
-                    // Safety: This is done in a pinned section, so we know that
-                    // the linked section stays alive for the duration of this
-                    // future due to pinning guarantees.
-                    unsafe { internal.link_core(&mut critical, lim) };
-
-                    trace!(until = ?critical.deadline, "taking over core and sleeping");
-                    *state = State::Core;
-                    sleep.set(Some(time::sleep_until(critical.deadline)));
-                    trace!("no immediate tokens available");
+        match state {
+            State::Complete => {
+                return Poll::Ready(());
+            }
+            State::Initial => {
+                // Safety: The task is not linked up yet, so we can safely
+                // inspect the number of permits without having to
+                // synchronize.
+                if permits == 0 {
+                    *state = State::Complete;
+                    return Poll::Ready(());
                 }
-                State::Waiting => {
-                    // If we are complete, then return as ready.
-                    //
-                    // This field is atomic, so we can safely read it under shared
-                    // access and do not require a lock.
-                    if internal.complete().load(Ordering::Acquire) {
-                        *state = State::Complete;
-                        return Poll::Ready(());
-                    }
 
-                    // Note: we need to operate under this lock to ensure that
-                    // the core acquired here (or elsewhere) observes that the
-                    // current task has been linked up.
-                    let mut critical = lim.critical.lock();
+                critical = lim.critical.lock();
+                now = Instant::now();
 
-                    // Try to take over as core. If we're unsuccessful we
-                    // just ensure that we're linked into the wait queue.
-                    if !mem::take(&mut critical.available) {
-                        internal.update(&mut critical, cx.waker());
-                        return Poll::Pending;
-                    }
-
-                    // Safety: This is done in a pinned section, so we know that
-                    // the linked section stays alive for the duration of this
-                    // future due to pinning guarantees.
-                    let assumed = unsafe { internal.assume_core(&mut critical, lim) };
-
-                    if !assumed {
-                        // Marks as completed.
-                        *state = State::Complete;
-                        return Poll::Ready(());
-                    }
-
-                    trace!(until = ?critical.deadline, "taking over core and sleeping");
-                    *state = State::Core;
-
-                    match sleep.as_mut().as_pin_mut() {
-                        Some(sleep) => {
-                            sleep.reset(critical.deadline);
-                        }
-                        None => {
-                            sleep.set(Some(time::sleep_until(critical.deadline)));
-                        }
-                    }
+                // If we've hit a deadline, calculate the number of tokens
+                // to drain and perform it in line here. This is necessary
+                // because the core isn't aware of how long we sleep between
+                // each acquire, so we need to perform some of the drain
+                // work here in order to avoid acruing a debt that needs to
+                // be filled later in.
+                //
+                // If we didn't do this, and the process slept for a long
+                // time, the next time a core is acquired it would be very
+                // far removed from the expected deadline and has no idea
+                // when permits were acquired, so it would over-eagerly
+                // release a lot of acquires and accumulate permits.
+                //
+                // This is tested for in the `test_idle` suite of tests.
+                if let Some((tokens, deadline)) = lim.calculate_drain(critical.deadline, now) {
+                    trace!(tokens = tokens, "inline drain");
+                    // We pre-emptively update the deadline of the core
+                    // since it might bump, and we don't want other
+                    // processes to observe that the deadline has been
+                    // reached.
+                    critical.deadline = deadline;
+                    internal.drain_wait_queue(&mut critical, tokens, lim);
                 }
-                State::Core => {
-                    if let Some(sleep) = sleep.as_mut().as_pin_mut() {
-                        if sleep.poll(cx).is_pending() {
-                            return Poll::Pending;
-                        }
-                    }
 
-                    let now = Instant::now();
-                    trace!(now = ?now, "sleep completed");
-                    let mut critical = lim.critical.lock();
-                    critical.deadline = now + lim.interval;
-
-                    // Safety: we know that we're the only one with access to core
-                    // because we ensured it as we acquire the `available` lock.
-                    if internal.drain_core(&mut critical, lim.refill, lim) {
-                        critical.release();
-                        *state = State::Complete;
-                        return Poll::Ready(());
-                    }
-
-                    trace!(sleep = ?lim.interval, "keeping core and sleeping");
-
-                    match sleep.as_mut().as_pin_mut() {
-                        Some(sleep) => {
-                            sleep.reset(critical.deadline);
-                        }
-                        None => {
-                            sleep.set(Some(time::sleep_until(critical.deadline)));
-                        }
-                    }
+                // Test the fast path first, where we simply subtract the
+                // permits available from the current balance.
+                if let Some(balance) = critical.balance.checked_sub(permits) {
+                    critical.balance = balance;
+                    *state = State::Complete;
+                    return Poll::Ready(());
                 }
-                State::Complete => {
-                    panic!("polled after completion");
+
+                let balance = mem::take(&mut critical.balance);
+
+                let remaining = permits - balance;
+
+                // Safety: This is done in a pinned section, so we know that
+                // the linked section stays alive for the duration of this
+                // future due to pinning guarantees.
+                internal.with_task_mut(&mut critical, |_, task| {
+                    task.remaining = remaining;
+                });
+
+                // Try to take over as core. If we're unsuccessful we just
+                // ensure that we're linked into the wait queue.
+                if !mem::take(&mut critical.available) {
+                    internal.update(&mut critical, cx.waker());
+                    *state = State::Waiting;
+                    return Poll::Pending;
                 }
+
+                // Safety: This is done in a pinned section, so we know that
+                // the linked section stays alive for the duration of this
+                // future due to pinning guarantees.
+                internal.link_core(&mut critical, lim);
+                *state = State::Core;
+            }
+            State::Waiting => {
+                // If we are complete, then return as ready.
+                //
+                // This field is atomic, so we can safely read it under shared
+                // access and do not require a lock.
+                if internal.complete().load(Ordering::Acquire) {
+                    *state = State::Complete;
+                    return Poll::Ready(());
+                }
+
+                // Note: we need to operate under this lock to ensure that
+                // the core acquired here (or elsewhere) observes that the
+                // current task has been linked up.
+                critical = lim.critical.lock();
+
+                // Try to take over as core. If we're unsuccessful we
+                // just ensure that we're linked into the wait queue.
+                if !mem::take(&mut critical.available) {
+                    internal.update(&mut critical, cx.waker());
+                    return Poll::Pending;
+                }
+
+                now = Instant::now();
+
+                // This is done in a pinned section, so we know that the linked
+                // section stays alive for the duration of this future due to
+                // pinning guarantees.
+                if !internal.assume_core(&mut critical, lim, now) {
+                    // Marks as completed.
+                    *state = State::Complete;
+                    return Poll::Ready(());
+                }
+
+                MutexGuard::bump(&mut critical);
+                *state = State::Core;
+            }
+            State::Core => {
+                critical = lim.critical.lock();
+                now = Instant::now();
             }
         }
+
+        trace!(until = ?critical.deadline, "taking over core and sleeping");
+
+        let mut sleep = match sleep.as_mut().as_pin_mut() {
+            Some(mut sleep) => {
+                if sleep.deadline() != critical.deadline {
+                    sleep.as_mut().reset(critical.deadline);
+                }
+
+                sleep
+            }
+            None => {
+                sleep.set(Some(time::sleep_until(critical.deadline)));
+                sleep.as_mut().as_pin_mut().unwrap()
+            }
+        };
+
+        if sleep.as_mut().poll(cx).is_pending() {
+            return Poll::Pending;
+        }
+
+        trace!(now = ?now, "sleep completed");
+        critical.deadline = now + lim.interval;
+
+        // Safety: we know that we're the only one with access to core
+        // because we ensured it as we acquire the `available` lock.
+        if internal.drain_core(&mut critical, lim.refill, lim) {
+            critical.release();
+            *state = State::Complete;
+            return Poll::Ready(());
+        }
+
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 }
 
@@ -1556,7 +1569,7 @@ where
         let lim = self.lim.as_ref();
 
         match &mut self.state {
-            State::Waiting => unsafe {
+            State::Waiting => {
                 debug_assert! {
                     self.internal.linked,
                     "waiting nodes have to be linked",
@@ -1568,13 +1581,13 @@ where
                 let mut critical = lim.critical.lock();
                 self.internal
                     .release_remaining(&mut critical, self.permits, lim);
-            },
-            State::Core { .. } => unsafe {
+            }
+            State::Core { .. } => {
                 let mut critical = lim.critical.lock();
                 self.internal
                     .release_remaining(&mut critical, self.permits, lim);
                 critical.release();
-            },
+            }
             _ => (),
         }
     }
