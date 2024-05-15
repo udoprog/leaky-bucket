@@ -34,7 +34,7 @@
 //!
 //! ```
 //! use leaky_bucket::RateLimiter;
-//! use tokio::time;
+//! use tokio::time::Instant;
 //!
 //! # #[tokio::main(flavor="current_thread", start_paused=true)] async fn main() {
 //! let limiter = RateLimiter::builder()
@@ -43,7 +43,7 @@
 //!     .refill(5)
 //!     .build();
 //!
-//! let start = time::Instant::now();
+//! let start = Instant::now();
 //!
 //! println!("Waiting for permit...");
 //!
@@ -56,7 +56,7 @@
 //!
 //! println!(
 //!     "I made it in {:?}!",
-//!     time::Instant::now().duration_since(start)
+//!     Instant::now().duration_since(start)
 //! );
 //! # }
 //! ```
@@ -75,14 +75,14 @@
 //! *core*. This is known as *core switching*.
 //!
 //! ```
-//! use std::time;
+//! use std::time::Duration;
 //!
 //! use leaky_bucket::RateLimiter;
 //!
 //! # #[tokio::main(flavor="current_thread", start_paused=true)] async fn main() {
 //! let limiter = RateLimiter::builder()
 //!     .initial(10)
-//!     .interval(time::Duration::from_millis(100))
+//!     .interval(Duration::from_millis(100))
 //!     .build();
 //!
 //! // This is instantaneous since the rate limiter starts with 10 tokens to
@@ -228,7 +228,7 @@ use core::task::{Context, Poll, Waker};
 use alloc::sync::Arc;
 
 use parking_lot::{Mutex, MutexGuard};
-use tokio::time;
+use tokio::time::{self, Duration, Instant};
 
 #[cfg(feature = "tracing")]
 macro_rules! trace {
@@ -306,7 +306,7 @@ struct Critical {
     /// Waiter list.
     waiters: LinkedList<Task>,
     /// The deadline for when more tokens can be be added.
-    deadline: time::Instant,
+    deadline: Instant,
     /// If the core is available.
     available: bool,
 }
@@ -346,7 +346,7 @@ pub struct RateLimiter {
     /// Tokens to add every `per` duration.
     refill: usize,
     /// Interval in milliseconds to add tokens.
-    interval: time::Duration,
+    interval: Duration,
     /// Max number of tokens associated with the rate limiter.
     max: usize,
     /// If the rate limiter is fair or not.
@@ -410,7 +410,7 @@ impl RateLimiter {
     ///
     /// assert_eq!(limiter.interval(), Duration::from_millis(1000));
     /// ```
-    pub fn interval(&self) -> time::Duration {
+    pub fn interval(&self) -> Duration {
         self.interval
     }
 
@@ -657,8 +657,8 @@ impl RateLimiter {
 
     /// Calculate refill amount. Returning a tuple of how much to fill and remaining
     /// duration to sleep until the next refill time if appropriate.
-    fn calculate_drain(&self, deadline: time::Instant) -> Option<(usize, time::Instant)> {
-        let now = time::Instant::now();
+    fn calculate_drain(&self, deadline: Instant) -> Option<(usize, Instant)> {
+        let now = Instant::now();
 
         if now < deadline {
             return None;
@@ -860,7 +860,7 @@ impl Builder {
     ///     .build();
     /// ```
     pub fn build(&self) -> RateLimiter {
-        let deadline = time::Instant::now() + self.interval;
+        let deadline = Instant::now() + self.interval;
 
         let max = match self.max {
             Some(max) => max,
@@ -1516,7 +1516,7 @@ where
                         }
                     }
 
-                    let now = time::Instant::now();
+                    let now = Instant::now();
                     trace!(now = ?now, "sleep completed");
                     let mut critical = lim.critical.lock();
                     critical.deadline = now + lim.interval;

@@ -37,7 +37,7 @@ methods.
 
 ```rust
 use leaky_bucket::RateLimiter;
-use tokio::time;
+use tokio::time::Instant;
 
 let limiter = RateLimiter::builder()
     .max(10)
@@ -45,7 +45,7 @@ let limiter = RateLimiter::builder()
     .refill(5)
     .build();
 
-let start = time::Instant::now();
+let start = Instant::now();
 
 println!("Waiting for permit...");
 
@@ -58,7 +58,7 @@ let ((), (), ()) = tokio::join!(a, b, c);
 
 println!(
     "I made it in {:?}!",
-    time::Instant::now().duration_since(start)
+    Instant::now().duration_since(start)
 );
 ```
 
@@ -76,13 +76,13 @@ a slow path. Here one of the acquiring tasks will switch over to work as a
 *core*. This is known as *core switching*.
 
 ```rust
-use std::time;
+use std::time::Duration;
 
 use leaky_bucket::RateLimiter;
 
 let limiter = RateLimiter::builder()
     .initial(10)
-    .interval(time::Duration::from_millis(100))
+    .interval(Duration::from_millis(100))
     .build();
 
 // This is instantaneous since the rate limiter starts with 10 tokens to
