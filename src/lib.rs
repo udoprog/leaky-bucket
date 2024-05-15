@@ -218,7 +218,6 @@ use core::cell::UnsafeCell;
 use core::convert::TryFrom as _;
 use core::fmt;
 use core::future::Future;
-use core::marker;
 use core::mem;
 use core::pin::Pin;
 use core::ptr;
@@ -312,6 +311,16 @@ struct Critical {
 }
 
 impl Critical {
+    #[inline]
+    fn push_task_front(&mut self, task: &mut Node<Task>) {
+        // SAFETY: We both have mutable access to the node being pushed, and
+        // mutable access to the critical section through `self`. So we know we
+        // have exclusive tampering rights to the waiter queue.
+        unsafe {
+            self.waiters.push_front(task.into());
+        }
+    }
+
     #[inline]
     fn push_task(&mut self, task: &mut Node<Task>) {
         // SAFETY: We both have mutable access to the node being pushed, and
@@ -939,24 +948,21 @@ enum State {
 struct AcquireState {
     /// If we are linked or not.
     linked: bool,
-    /// Inner state of the acquire.
-    linking: UnsafeCell<Linking>,
+    /// Aliased task state.
+    task: UnsafeCell<Node<Task>>,
 }
 
 impl AcquireState {
     #[allow(clippy::declare_interior_mutable_const)]
     const INITIAL: AcquireState = AcquireState {
         linked: false,
-        linking: UnsafeCell::new(Linking {
-            task: Node::new(Task::new()),
-            _pin: marker::PhantomPinned,
-        }),
+        task: UnsafeCell::new(Node::new(Task::new())),
     };
 
     /// Access the completion flag.
     pub fn complete(&self) -> &AtomicBool {
         // SAFETY: This is always safe to access since it's atomic.
-        unsafe { &*ptr::addr_of!((*self.linking.get()).task.complete) }
+        unsafe { &*ptr::addr_of!((*self.task.get()).complete) }
     }
 
     /// Get the underlying task mutably.
@@ -972,7 +978,7 @@ impl AcquireState {
         // it's passed in as a mutable argument. We can also ensure that none of
         // the borrows outlive the provided closure.
         unsafe {
-            let task = &mut *ptr::addr_of_mut!((*self.linking.get()).task);
+            let task = &mut *self.task.get();
             f(critical, task)
         }
     }
@@ -990,8 +996,7 @@ impl AcquireState {
         // it's passed in as a mutable argument. We can also ensure that none of
         // the borrows outlive the provided closure.
         unsafe {
-            let node = self.linking.get();
-            let task = &mut *ptr::addr_of_mut!((*node).task);
+            let task = &mut *self.task.get();
             f(critical, task, &mut self.linked);
         }
     }
@@ -1007,12 +1012,7 @@ impl AcquireState {
             if !*linked {
                 trace!("linking self");
                 *linked = true;
-
-                // SAFETY: We have a mutable reference to the critical section,
-                // so exclusive access is guaranteed.
-                unsafe {
-                    critical.waiters.push_front(task.into());
-                }
+                critical.push_task_front(task);
             }
 
             let w = &mut task.waker;
@@ -1070,7 +1070,7 @@ impl AcquireState {
         }
 
         // Hand back permits which we've acquired so far.
-        let release = permits.saturating_sub(self.linking.get_mut().task.remaining);
+        let release = permits.saturating_sub(self.task.get_mut().remaining);
 
         // Temporarily assume the role of core and release the remaining
         // tokens to waiting tasks.
@@ -1591,19 +1591,6 @@ where
             _ => (),
         }
     }
-}
-
-/// All of the state that is linked into the wait queue.
-///
-/// This is only ever accessed through raw pointer manipulation to avoid issues
-/// with field aliasing.
-#[repr(C)]
-struct Linking {
-    /// The node in the linked list.
-    task: Node<Task>,
-    /// Avoids noalias heuristics from kicking in on references to a `Linking`
-    /// struct.
-    _pin: marker::PhantomPinned,
 }
 
 #[cfg(test)]
