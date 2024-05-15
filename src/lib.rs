@@ -151,9 +151,9 @@
 //!
 //! By default [`RateLimiter`] uses a *fair* scheduler. This ensures that the
 //! core task makes progress even if there are many tasks waiting to acquire
-//! tokens. As a result it causes more frequent core switching, increasing the
-//! total work needed. An unfair scheduler is expected to do a bit less work
-//! under contention. But without fair scheduling some tasks might end up taking
+//! tokens. This might cause more core switching, increasing the total work
+//! needed. An unfair scheduler is expected to do a bit less work under
+//! contention. But without fair scheduling some tasks might end up taking
 //! longer to acquire than expected.
 //!
 //! This behavior can be tweaked with the [`Builder::fair`] option.
@@ -350,21 +350,17 @@ impl Critical {
     #[cfg_attr(feature = "tracing", tracing::instrument(skip(self), level = "trace"))]
     fn release(&mut self) {
         trace!("releasing core");
-
         self.available = true;
 
         // Find another task that might take over as core. Once it has acquired
         // core status it will have to make sure it is no longer linked into the
         // wait queue.
-        //
-        // SAFETY: We're holding the lock guard to all the waiters so we can be
-        // certain that we have exclusive access.
         unsafe {
-            if let Some(mut node) = self.waiters.front() {
+            if let Some(node) = self.waiters.front() {
                 trace!(node = ?node, "waking next core");
 
-                if let Some(waker) = node.as_mut().waker.take() {
-                    waker.wake();
+                if let Some(ref waker) = node.as_ref().waker {
+                    waker.wake_by_ref();
                 }
             }
         }
@@ -716,7 +712,7 @@ impl RateLimiter {
     }
 }
 
-// Safety: All the internals of acquire is thread safe and correctly
+// SAFETY: All the internals of acquire is thread safe and correctly
 // synchronized. The embedded waiter queue doesn't have anything inherently
 // unsafe in it.
 unsafe impl Send for RateLimiter {}
@@ -1116,8 +1112,8 @@ impl AcquireFutInner {
         critical.deadline = deadline;
 
         if self.drain_core(critical, tokens, lim) {
-            // We synthetically "ran" at the current time minus the remaining time
-            // we need to wait until the last update period.
+            // Everything was drained, including the current core. So we have to
+            // release it now.
             critical.release();
             return false;
         }
@@ -1137,7 +1133,7 @@ fn drain_wait_queue(critical: &mut MutexGuard<'_, Critical>, tokens: usize, lim:
 
     let mut bump = 0;
 
-    // Safety: we're holding the lock guard to all the waiters so we can be
+    // SAFETY: we're holding the lock guard to all the waiters so we can be
     // sure that we have exclusive access to the wait queue.
     unsafe {
         while critical.balance > 0 {
@@ -1358,11 +1354,11 @@ where
     }
 }
 
-// Safety: All the internals of acquire is thread safe and correctly
+// SAFETY: All the internals of acquire is thread safe and correctly
 // synchronized. The embedded waiter queue doesn't have anything inherently
 // unsafe in it.
-unsafe impl<T> Send for AcquireFut<T> where T: Deref<Target = RateLimiter> {}
-unsafe impl<T> Sync for AcquireFut<T> where T: Deref<Target = RateLimiter> {}
+unsafe impl<T> Send for AcquireFut<T> where T: Send + Deref<Target = RateLimiter> {}
+unsafe impl<T> Sync for AcquireFut<T> where T: Sync + Deref<Target = RateLimiter> {}
 
 impl<T> Future for AcquireFut<T>
 where
@@ -1393,7 +1389,7 @@ where
                 return Poll::Ready(());
             }
             State::Initial => {
-                // Safety: The task is not linked up yet, so we can safely
+                // SAFETY: The task is not linked up yet, so we can safely
                 // inspect the number of permits without having to
                 // synchronize.
                 if *permits == 0 {
@@ -1440,7 +1436,7 @@ where
 
                 let remaining = *permits - balance;
 
-                // Safety: This is done in a pinned section, so we know that
+                // SAFETY: This is done in a pinned section, so we know that
                 // the linked section stays alive for the duration of this
                 // future due to pinning guarantees.
                 internal.as_mut().with_task_mut(&mut critical, |_, task| {
@@ -1455,10 +1451,11 @@ where
                     return Poll::Pending;
                 }
 
-                // Safety: This is done in a pinned section, so we know that
+                // SAFETY: This is done in a pinned section, so we know that
                 // the linked section stays alive for the duration of this
                 // future due to pinning guarantees.
                 internal.as_mut().link_core(&mut critical, lim);
+                MutexGuard::bump(&mut critical);
                 *state = State::Core;
                 outer_now = Some(now);
             }
