@@ -976,10 +976,7 @@ impl AcquireState {
         // SAFETY: Caller has exclusive access to the critical section, since
         // it's passed in as a mutable argument. We can also ensure that none of
         // the borrows outlive the provided closure.
-        unsafe {
-            let task = &mut *self.task.get();
-            f(critical, task)
-        }
+        unsafe { f(critical, &mut *self.task.get()) }
     }
 
     /// Update the waiting state for this acquisition task. This might require
@@ -990,20 +987,18 @@ impl AcquireState {
     )]
     fn update(&mut self, critical: &mut MutexGuard<'_, Critical>, waker: &Waker) {
         self.with_task_mut(critical, |critical, task| {
-            if !task.linked() {
+            if !task.is_linked() {
                 critical.push_task_front(task);
             }
 
-            let w = &mut task.waker;
-
-            let new_waker = match w {
+            let new_waker = match task.waker {
                 None => true,
-                Some(w) => !w.will_wake(waker),
+                Some(ref w) => !w.will_wake(waker),
             };
 
             if new_waker {
                 trace!("updating waker");
-                *w = Some(waker.clone());
+                task.waker = Some(waker.clone());
             }
         });
     }
@@ -1015,13 +1010,15 @@ impl AcquireState {
     )]
     fn link_core(&mut self, critical: &mut Critical, lim: &RateLimiter) {
         self.with_task_mut(critical, |critical, task| {
-            match (lim.fair, task.linked()) {
+            match (lim.fair, task.is_linked()) {
                 (true, false) => {
                     // Fair scheduling needs to ensure that the core is part of the wait
                     // queue, and will be woken up in-order with other tasks.
                     critical.push_task(task);
                 }
                 (false, true) => {
+                    // Unfair scheduling will not wake the core in order, so
+                    // don't bother having it linked.
                     critical.remove_task(task);
                 }
                 _ => {}
@@ -1036,14 +1033,16 @@ impl AcquireState {
         permits: usize,
         lim: &RateLimiter,
     ) {
-        self.with_task_mut(critical, |critical, task| {
-            if task.linked() {
+        let remaining = self.with_task_mut(critical, |critical, task| {
+            if task.is_linked() {
                 critical.remove_task(task);
             }
+
+            task.remaining
         });
 
         // Hand back permits which we've acquired so far.
-        let release = permits.saturating_sub(self.task.get_mut().remaining);
+        let release = permits.saturating_sub(remaining);
 
         // Temporarily assume the role of core and release the remaining
         // tokens to waiting tasks.
@@ -1125,20 +1124,19 @@ impl AcquireState {
     ) -> bool {
         self.drain_wait_queue(critical, tokens, lim);
 
-        if lim.fair {
-            // We only need to check the state since the current core holder is
-            // linked up to the wait queue.
-            self.with_task_mut(critical, |_, task| task.is_completed())
-        } else {
+        // We only need to check the state since the current core holder is
+        // linked up to the wait queue.
+        self.with_task_mut(critical, |critical, task| {
             // If the limiter is not fair, we need to in addition to draining
             // remaining tokens from linked nodes, drain it from ourselves. We
             // fill the current holder of the core last (self). To ensure that
             // it stays around for as long as possible.
-            self.with_task_mut(critical, |critical, task| {
+            if !lim.fair {
                 task.fill(&mut critical.balance);
-                task.is_completed()
-            })
-        }
+            }
+
+            task.is_completed()
+        })
     }
 
     /// Assume the current core and calculate how long we must sleep for in
