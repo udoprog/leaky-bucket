@@ -68,12 +68,13 @@ println!(
 
 Each rate limiter has two acquisition modes. A fast path and a slow path.
 The fast path is used if the desired number of tokens are readily available,
-and involves incrementing an atomic counter indicating that the acquired
-number of tokens have been added to the bucket.
+and simply involves decrementing the number of tokens available in the
+shared pool.
 
-If this counter goes over its configured maximum capacity, it overflows into
-a slow path. Here one of the acquiring tasks will switch over to work as a
-*core*. This is known as *core switching*.
+If the required number of tokens is not available, the task will be forced
+to be suspended until the next refill interval. Here one of the acquiring
+tasks will switch over to work as a *core*. This is known as *core
+switching*.
 
 ```rust
 use std::time::Duration;
@@ -147,9 +148,9 @@ std::mem::forget(a0);
 
 By default [`RateLimiter`] uses a *fair* scheduler. This ensures that the
 core task makes progress even if there are many tasks waiting to acquire
-tokens. As a result it causes more frequent core switching, increasing the
-total work needed. An unfair scheduler is expected to do a bit less work
-under contention. But without fair scheduling some tasks might end up taking
+tokens. This might cause more core switching, increasing the total work
+needed. An unfair scheduler is expected to do a bit less work under
+contention. But without fair scheduling some tasks might end up taking
 longer to acquire than expected.
 
 This behavior can be tweaked with the [`Builder::fair`] option.

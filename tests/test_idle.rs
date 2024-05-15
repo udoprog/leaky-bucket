@@ -6,12 +6,6 @@ use tokio::time::{self, Duration};
 
 #[tokio::test(start_paused = true)]
 async fn test_idle_1() {
-    // We expect 20 seconds to pass, because sleeping prior to attempting to
-    // acquire permits does not "accumulate" more permits and the first five
-    // permits are initialized, while we need to wait two seconds each for the
-    // remaining five to accumulate plus the time we're sleeping of 4 seconds.
-    const EXPECTED: Duration = Duration::from_millis(14000);
-
     let limiter = RateLimiter::builder()
         .refill(1)
         .interval(Duration::from_secs(2))
@@ -19,23 +13,35 @@ async fn test_idle_1() {
         .initial(5)
         .build();
 
-    let start = time::Instant::now();
-    time::sleep(Duration::from_millis(4000)).await;
+    time::sleep(Duration::from_millis(10000)).await;
 
-    for _ in 0..10 {
+    let start = time::Instant::now();
+    // This one is "free", since we've slept before acquiring it.
+    limiter.acquire_one().await;
+
+    // These ones drain the available permits.
+    for _ in 0..5 {
         limiter.acquire_one().await;
     }
 
-    let elapsed = time::Instant::now().duration_since(start);
-    assert_eq!(elapsed, EXPECTED);
+    assert_eq!(
+        time::Instant::now().duration_since(start),
+        Duration::from_secs(0)
+    );
+
+    // These ones need to sleep for 2 seconds for each permit.
+    for _ in 0..5 {
+        limiter.acquire_one().await;
+    }
+
+    assert_eq!(
+        time::Instant::now().duration_since(start),
+        Duration::from_secs(10)
+    );
 }
 
 #[tokio::test(start_paused = true)]
 async fn test_idle_2() {
-    // We expect 2000 milliseconds to pass, because sleeping prior to
-    // attempting to acquire permits does not "accumulate" more permits.
-    const EXPECTED: Duration = Duration::from_millis(2000);
-
     let limiter = RateLimiter::builder()
         .refill(1)
         .interval(Duration::from_secs(2))
@@ -43,20 +49,26 @@ async fn test_idle_2() {
         .initial(5)
         .build();
 
-    time::sleep(Duration::from_millis(4000)).await;
+    time::sleep(Duration::from_millis(10000)).await;
 
+    // This one is "free", since it is within the time window we've slept.
     limiter.acquire_one().await;
     let start = time::Instant::now();
 
-    for _ in 0..4 {
+    for _ in 0..5 {
         limiter.acquire_one().await;
     }
 
+    assert_eq!(
+        time::Instant::now().duration_since(start),
+        Duration::from_secs(0)
+    );
+    // This one will have to wait for 2 seconds.
     limiter.acquire_one().await;
-
-    let elapsed = time::Instant::now().duration_since(start);
-    println!("elapsed: {:?}", elapsed);
-    assert_eq!(elapsed, EXPECTED);
+    assert_eq!(
+        time::Instant::now().duration_since(start),
+        Duration::from_secs(2)
+    );
 }
 
 #[tokio::test(start_paused = true)]
