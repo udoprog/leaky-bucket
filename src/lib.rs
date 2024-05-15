@@ -543,8 +543,6 @@ impl RateLimiter {
             return false;
         }
 
-        dbg!(critical.balance, permits);
-
         if critical.balance >= permits {
             critical.balance -= permits;
             return true;
