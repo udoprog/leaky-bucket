@@ -31,8 +31,9 @@ slots it never uses which would be the case for cell-based rate limiters.
 
 ## Usage
 
-The core type is the [`RateLimiter`] type, which allows for limiting the
-throughput of a section using its [`acquire`] and [`acquire_one`] methods.
+The core type is [`RateLimiter`], which allows for limiting the throughput
+of a section using its [`acquire`], [`try_acquire`], and [`acquire_one`]
+methods.
 
 ```rust
 use leaky_bucket::RateLimiter;
@@ -75,8 +76,9 @@ a slow path. Here one of the acquiring tasks will switch over to work as a
 *core*. This is known as *core switching*.
 
 ```rust
-use leaky_bucket::RateLimiter;
 use std::time;
+
+use leaky_bucket::RateLimiter;
 
 let limiter = RateLimiter::builder()
     .initial(10)
@@ -113,10 +115,11 @@ guard.
 > ```
 
 ```rust
-use leaky_bucket::RateLimiter;
 use std::future::Future;
 use std::sync::Arc;
 use std::task::Context;
+
+use leaky_bucket::RateLimiter;
 
 struct Waker;
 
@@ -190,10 +193,11 @@ As can be seen above the first task in the *unfair* scheduler takes longer
 to run because it prioritises releasing other tasks waiting to acquire over
 itself.
 
-[`acquire_one`]: https://docs.rs/leaky-bucket/0/leaky_bucket/struct.RateLimiter.html#method.acquire_one
-[`acquire`]: https://docs.rs/leaky-bucket/0/leaky_bucket/struct.RateLimiter.html#method.acquire
-[`Builder::fair`]: https://docs.rs/leaky-bucket/0/leaky_bucket/struct.Builder.html#method.fair
+[`acquire_one`]: https://docs.rs/leaky-bucket/1/leaky_bucket/struct.RateLimiter.html#method.acquire_one
+[`acquire`]: https://docs.rs/leaky-bucket/1/leaky_bucket/struct.RateLimiter.html#method.acquire
+[`Builder::fair`]: https://docs.rs/leaky-bucket/1/leaky_bucket/struct.Builder.html#method.fair
 [`Mutex`]: https://docs.rs/tokio/1/tokio/sync/struct.Mutex.html
-[`RateLimiter`]: https://docs.rs/leaky-bucket/0/leaky_bucket/struct.RateLimiter.html
+[`RateLimiter`]: https://docs.rs/leaky-bucket/1/leaky_bucket/struct.RateLimiter.html
 [`time` feature]: https://docs.rs/tokio/1/tokio/#feature-flags
+[`try_acquire`]: https://docs.rs/leaky-bucket/1/leaky_bucket/struct.RateLimiter.html#method.try_acquire
 [leaky bucket]: https://en.wikipedia.org/wiki/Leaky_bucket

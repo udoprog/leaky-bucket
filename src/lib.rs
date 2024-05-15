@@ -28,8 +28,9 @@
 //!
 //! ## Usage
 //!
-//! The core type is the [`RateLimiter`] type, which allows for limiting the
-//! throughput of a section using its [`acquire`] and [`acquire_one`] methods.
+//! The core type is [`RateLimiter`], which allows for limiting the throughput
+//! of a section using its [`acquire`], [`try_acquire`], and [`acquire_one`]
+//! methods.
 //!
 //! ```
 //! use leaky_bucket::RateLimiter;
@@ -74,8 +75,9 @@
 //! *core*. This is known as *core switching*.
 //!
 //! ```
-//! use leaky_bucket::RateLimiter;
 //! use std::time;
+//!
+//! use leaky_bucket::RateLimiter;
 //!
 //! # #[tokio::main(flavor="current_thread", start_paused=true)] async fn main() {
 //! let limiter = RateLimiter::builder()
@@ -114,10 +116,11 @@
 //! > ```
 //!
 //! ```no_run
-//! use leaky_bucket::RateLimiter;
 //! use std::future::Future;
 //! use std::sync::Arc;
 //! use std::task::Context;
+//!
+//! use leaky_bucket::RateLimiter;
 //!
 //! struct Waker;
 //! # impl std::task::Wake for Waker { fn wake(self: Arc<Self>) { } }
@@ -194,12 +197,13 @@
 //! to run because it prioritises releasing other tasks waiting to acquire over
 //! itself.
 //!
-//! [`acquire_one`]: https://docs.rs/leaky-bucket/0/leaky_bucket/struct.RateLimiter.html#method.acquire_one
-//! [`acquire`]: https://docs.rs/leaky-bucket/0/leaky_bucket/struct.RateLimiter.html#method.acquire
-//! [`Builder::fair`]: https://docs.rs/leaky-bucket/0/leaky_bucket/struct.Builder.html#method.fair
+//! [`acquire_one`]: https://docs.rs/leaky-bucket/1/leaky_bucket/struct.RateLimiter.html#method.acquire_one
+//! [`acquire`]: https://docs.rs/leaky-bucket/1/leaky_bucket/struct.RateLimiter.html#method.acquire
+//! [`Builder::fair`]: https://docs.rs/leaky-bucket/1/leaky_bucket/struct.Builder.html#method.fair
 //! [`Mutex`]: https://docs.rs/tokio/1/tokio/sync/struct.Mutex.html
-//! [`RateLimiter`]: https://docs.rs/leaky-bucket/0/leaky_bucket/struct.RateLimiter.html
+//! [`RateLimiter`]: https://docs.rs/leaky-bucket/1/leaky_bucket/struct.RateLimiter.html
 //! [`time` feature]: https://docs.rs/tokio/1/tokio/#feature-flags
+//! [`try_acquire`]: https://docs.rs/leaky-bucket/1/leaky_bucket/struct.RateLimiter.html#method.try_acquire
 //! [leaky bucket]: https://en.wikipedia.org/wiki/Leaky_bucket
 
 #![no_std]
