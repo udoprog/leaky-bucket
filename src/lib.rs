@@ -346,6 +346,7 @@ impl Critical {
     #[cfg_attr(feature = "tracing", tracing::instrument(skip(self), level = "trace"))]
     fn release(&mut self) {
         trace!("releasing core");
+
         self.available = true;
 
         // Find another task that might take over as core. Once it has acquired
@@ -355,7 +356,7 @@ impl Critical {
         // SAFETY: We're holding the lock guard to all the waiters so we can be
         // certain that we have exclusive access.
         unsafe {
-            if let Some(mut node) = self.waiters.front_mut() {
+            if let Some(mut node) = self.waiters.front() {
                 trace!(node = ?node, "waking next core");
 
                 if let Some(waker) = node.as_mut().waker.take() {
@@ -946,18 +947,16 @@ enum State {
 /// Internal state of the acquire. This is separated because it can be computed
 /// in constant time.
 struct AcquireState {
-    /// If we are linked or not.
-    linked: bool,
     /// Aliased task state.
     task: UnsafeCell<Node<Task>>,
 }
 
 impl AcquireState {
-    #[allow(clippy::declare_interior_mutable_const)]
-    const INITIAL: AcquireState = AcquireState {
-        linked: false,
-        task: UnsafeCell::new(Node::new(Task::new())),
-    };
+    const fn new() -> AcquireState {
+        AcquireState {
+            task: UnsafeCell::new(Node::new(Task::new())),
+        }
+    }
 
     /// Access the completion flag.
     pub fn complete(&self) -> &AtomicBool {
@@ -983,24 +982,6 @@ impl AcquireState {
         }
     }
 
-    /// Get the underlying task, completion flag and linked boolean mutably.
-    ///
-    /// We prove that the caller does indeed have mutable access to the node by
-    /// passing in a mutable reference to the critical section.
-    #[inline]
-    pub fn with_task_extra_mut<F>(&mut self, critical: &mut Critical, f: F)
-    where
-        F: FnOnce(&mut Critical, &mut Node<Task>, &mut bool),
-    {
-        // SAFETY: Caller has exclusive access to the critical section, since
-        // it's passed in as a mutable argument. We can also ensure that none of
-        // the borrows outlive the provided closure.
-        unsafe {
-            let task = &mut *self.task.get();
-            f(critical, task, &mut self.linked);
-        }
-    }
-
     /// Update the waiting state for this acquisition task. This might require
     /// that we update the associated waker.
     #[cfg_attr(
@@ -1008,10 +989,8 @@ impl AcquireState {
         tracing::instrument(skip(self, critical, waker), level = "trace")
     )]
     fn update(&mut self, critical: &mut MutexGuard<'_, Critical>, waker: &Waker) {
-        self.with_task_extra_mut(critical, |critical, task, linked| {
-            if !*linked {
-                trace!("linking self");
-                *linked = true;
+        self.with_task_mut(critical, |critical, task| {
+            if !task.linked() {
                 critical.push_task_front(task);
             }
 
@@ -1035,25 +1014,19 @@ impl AcquireState {
         tracing::instrument(skip(self, critical, lim), level = "trace")
     )]
     fn link_core(&mut self, critical: &mut Critical, lim: &RateLimiter) {
-        if lim.fair {
-            // Fair scheduling needs to ensure that the core is part of the wait
-            // queue, and will be woken up in-order with other tasks.
-            if !mem::replace(&mut self.linked, true) {
-                self.with_task_mut(critical, |critical, task| {
+        self.with_task_mut(critical, |critical, task| {
+            if lim.fair {
+                // Fair scheduling needs to ensure that the core is part of the wait
+                // queue, and will be woken up in-order with other tasks.
+                if !task.linked() {
                     critical.push_task(task);
-                });
-            }
-        } else {
-            // Unfair scheduling the core task is not supposed to be in the wait
-            // queue, so remove it from there if we've successfully stolen it.
-            // Ensure that the current task is *not* linked since it is now to
-            // become the coordinator for everyone else.
-            if mem::take(&mut self.linked) {
-                self.with_task_mut(critical, |critical, task| {
+                }
+            } else {
+                if task.linked() {
                     critical.remove_task(task);
-                });
+                }
             }
-        }
+        });
     }
 
     /// Release any remaining tokens which are associated with this particular task.
@@ -1063,11 +1036,11 @@ impl AcquireState {
         permits: usize,
         lim: &RateLimiter,
     ) {
-        if mem::take(&mut self.linked) {
-            self.with_task_mut(critical, |critical, task| {
+        self.with_task_mut(critical, |critical, task| {
+            if task.linked() {
                 critical.remove_task(task);
-            });
-        }
+            }
+        });
 
         // Hand back permits which we've acquired so far.
         let release = permits.saturating_sub(self.task.get_mut().remaining);
@@ -1153,26 +1126,10 @@ impl AcquireState {
         self.drain_wait_queue(critical, tokens, lim);
 
         if lim.fair {
-            debug_assert! {
-                self.linked,
-                "core must be linked for fair scheduler",
-            };
-
             // We only need to check the state since the current core holder is
             // linked up to the wait queue.
-            if self.with_task_mut(critical, |_, task| task.is_completed()) {
-                // Task was unlinked by the drain action.
-                self.linked = false;
-                return true;
-            }
-
-            false
+            self.with_task_mut(critical, |_, task| task.is_completed())
         } else {
-            debug_assert! {
-                !self.linked,
-                "core must not be linked for an unfair scheduler",
-            };
-
             // If the limiter is not fair, we need to in addition to draining
             // remaining tokens from linked nodes, drain it from ourselves. We
             // fill the current holder of the core last (self). To ensure that
@@ -1359,7 +1316,7 @@ where
             permits,
             state: State::Initial,
             sleep: None,
-            internal: AcquireState::INITIAL,
+            internal: AcquireState::new(),
         }
     }
 
@@ -1574,11 +1531,6 @@ where
 
         match &mut self.state {
             State::Waiting => {
-                debug_assert! {
-                    self.internal.linked,
-                    "waiting nodes have to be linked",
-                };
-
                 // While the node is linked into the wait queue we have to
                 // ensure it's only accessed under a lock, but once it's been
                 // unlinked we can do what we want with it.

@@ -10,6 +10,8 @@ pub struct Node<T> {
     next: Option<ptr::NonNull<Node<T>>>,
     /// The previous node.
     prev: Option<ptr::NonNull<Node<T>>>,
+    /// If we are linked or not.
+    linked: bool,
     /// The value inside of the node.
     value: T,
     /// Avoids noalias heuristics from kicking in on references to a `Node<T>`
@@ -23,9 +25,15 @@ impl<T> Node<T> {
         Self {
             next: None,
             prev: None,
+            linked: false,
             value,
             _pin: marker::PhantomPinned,
         }
+    }
+
+    #[inline(always)]
+    pub(crate) fn linked(&self) -> bool {
+        self.linked
     }
 
     /// Set the next node.
@@ -96,8 +104,11 @@ impl<T> LinkedList<T> {
     /// use.
     #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace"))]
     pub(crate) unsafe fn push_front(&mut self, mut node: ptr::NonNull<Node<T>>) {
+        trace!(head = ?self.head, tail = ?self.tail, node = ?node, "push_front");
+
         debug_assert!(node.as_ref().next.is_none());
         debug_assert!(node.as_ref().prev.is_none());
+        debug_assert!(!node.as_ref().linked);
 
         if let Some(mut head) = self.head.take() {
             node.as_mut().set_next(Some(head));
@@ -107,6 +118,8 @@ impl<T> LinkedList<T> {
             self.head = Some(node);
             self.tail = Some(node);
         }
+
+        node.as_mut().linked = true;
     }
 
     /// Push to the front of the linked list.
@@ -129,6 +142,7 @@ impl<T> LinkedList<T> {
 
         debug_assert!(node.as_ref().next.is_none());
         debug_assert!(node.as_ref().prev.is_none());
+        debug_assert!(!node.as_ref().linked);
 
         if let Some(mut tail) = self.tail.take() {
             node.as_mut().set_prev(Some(tail));
@@ -138,6 +152,8 @@ impl<T> LinkedList<T> {
             self.head = Some(node);
             self.tail = Some(node);
         }
+
+        node.as_mut().linked = true;
     }
 
     #[cfg(test)]
@@ -146,6 +162,7 @@ impl<T> LinkedList<T> {
         trace!(head = ?self.head, tail = ?self.tail, "pop_front");
 
         let mut head = self.head?;
+        debug_assert!(head.as_ref().linked);
 
         if let Some(mut next) = head.as_mut().take_next() {
             next.as_mut().set_prev(None);
@@ -158,6 +175,7 @@ impl<T> LinkedList<T> {
 
         debug_assert!(head.as_ref().prev.is_none());
         debug_assert!(head.as_ref().next.is_none());
+        head.as_mut().linked = false;
         Some(head)
     }
 
@@ -167,6 +185,7 @@ impl<T> LinkedList<T> {
         trace!(head = ?self.head, tail = ?self.tail, "pop_back");
 
         let mut tail = self.tail?;
+        debug_assert!(tail.as_ref().linked);
 
         if let Some(mut prev) = tail.as_mut().take_prev() {
             prev.as_mut().set_next(None);
@@ -179,6 +198,7 @@ impl<T> LinkedList<T> {
 
         debug_assert!(tail.as_ref().prev.is_none());
         debug_assert!(tail.as_ref().next.is_none());
+        tail.as_mut().linked = false;
         Some(tail)
     }
 
@@ -186,6 +206,8 @@ impl<T> LinkedList<T> {
     #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace"))]
     pub(crate) unsafe fn remove(&mut self, mut node: ptr::NonNull<Node<T>>) {
         trace!(head = ?self.head, tail = ?self.tail, node = ?node, "remove");
+
+        debug_assert!(node.as_ref().linked);
 
         let next = node.as_mut().take_next();
         let prev = node.as_mut().take_prev();
@@ -203,6 +225,8 @@ impl<T> LinkedList<T> {
             debug_assert_eq!(self.head, Some(node));
             self.head = next;
         }
+
+        node.as_mut().linked = false;
     }
 
     /// Mutably get the front of the list.
@@ -210,7 +234,7 @@ impl<T> LinkedList<T> {
     /// This returns a raw pointer which can correctly be mutably accessed since
     /// the signature of this method ensures exclusive access to the list.
     #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace"))]
-    pub(crate) unsafe fn front_mut(&mut self) -> Option<ptr::NonNull<Node<T>>> {
+    pub(crate) unsafe fn front(&mut self) -> Option<ptr::NonNull<Node<T>>> {
         self.head
     }
 
@@ -345,7 +369,7 @@ mod tests {
                 n <<= 1;
             }
 
-            assert!(list.front_mut().is_none());
+            assert!(list.front().is_none());
         }
 
         assert_eq!(*a, 1);
