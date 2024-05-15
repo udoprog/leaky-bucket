@@ -1015,16 +1015,16 @@ impl AcquireState {
     )]
     fn link_core(&mut self, critical: &mut Critical, lim: &RateLimiter) {
         self.with_task_mut(critical, |critical, task| {
-            if lim.fair {
-                // Fair scheduling needs to ensure that the core is part of the wait
-                // queue, and will be woken up in-order with other tasks.
-                if !task.linked() {
+            match (lim.fair, task.linked()) {
+                (true, false) => {
+                    // Fair scheduling needs to ensure that the core is part of the wait
+                    // queue, and will be woken up in-order with other tasks.
                     critical.push_task(task);
                 }
-            } else {
-                if task.linked() {
+                (false, true) => {
                     critical.remove_task(task);
                 }
+                _ => {}
             }
         });
     }
