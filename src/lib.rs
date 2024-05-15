@@ -931,7 +931,7 @@ impl AcquireState {
     /// Access the completion flag.
     pub fn complete(&self) -> &AtomicBool {
         // SAFETY: This is always safe to access since it's atomic.
-        unsafe { &*ptr::addr_of!((*self.linking.get()).task.value().complete) }
+        unsafe { &*ptr::addr_of!((*self.linking.get()).task.complete) }
     }
 
     /// Get the underlying task mutably.
