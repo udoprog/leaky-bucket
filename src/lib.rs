@@ -67,12 +67,13 @@
 //!
 //! Each rate limiter has two acquisition modes. A fast path and a slow path.
 //! The fast path is used if the desired number of tokens are readily available,
-//! and involves incrementing an atomic counter indicating that the acquired
-//! number of tokens have been added to the bucket.
+//! and simply involves decrementing the number of tokens available in the
+//! shared pool.
 //!
-//! If this counter goes over its configured maximum capacity, it overflows into
-//! a slow path. Here one of the acquiring tasks will switch over to work as a
-//! *core*. This is known as *core switching*.
+//! If the required number of tokens is not available, the task will be forced
+//! to be suspended until the next refill interval. Here one of the acquiring
+//! tasks will switch over to work as a *core*. This is known as *core
+//! switching*.
 //!
 //! ```
 //! use std::time::Duration;
@@ -710,6 +711,73 @@ impl RateLimiter {
                 .saturating_sub(time::Duration::from_millis(rem));
         Some((tokens, deadline))
     }
+
+    /// Add tokens and release any pending tasks.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip(self, critical, f), level = "trace")
+    )]
+    #[inline]
+    fn add_tokens<F, O>(&self, critical: &mut MutexGuard<'_, Critical>, tokens: usize, f: F) -> O
+    where
+        F: FnOnce(&mut MutexGuard<'_, Critical>) -> O,
+    {
+        if tokens > 0 {
+            critical.balance = critical.balance.saturating_add(tokens);
+            drain_wait_queue(critical);
+            let output = f(critical);
+            critical.balance = critical.balance.min(self.max);
+            return output;
+        }
+
+        f(critical)
+    }
+}
+
+/// Refill the wait queue with the given number of tokens.
+#[cfg_attr(feature = "tracing", tracing::instrument(skip_all, level = "trace"))]
+fn drain_wait_queue(critical: &mut MutexGuard<'_, Critical>) {
+    trace!(balance = critical.balance, "releasing waiters");
+
+    let mut bump = 0;
+
+    // SAFETY: we're holding the lock guard to all the waiters so we can be
+    // sure that we have exclusive access to the wait queue.
+    unsafe {
+        while critical.balance > 0 {
+            let mut node = match critical.waiters.pop_back() {
+                Some(node) => node,
+                None => break,
+            };
+
+            let n = node.as_mut();
+            n.fill(&mut critical.balance);
+
+            trace! {
+                balance = critical.balance,
+                remaining = n.remaining,
+                "filled node",
+            };
+
+            if !n.is_completed() {
+                critical.waiters.push_back(node);
+                break;
+            }
+
+            n.complete.store(true, Ordering::Release);
+
+            if let Some(waker) = n.waker.take() {
+                waker.wake();
+            }
+
+            bump += 1;
+
+            if bump == BUMP_LIMIT {
+                MutexGuard::bump(critical);
+                bump = 0;
+            }
+        }
+    }
 }
 
 // SAFETY: All the internals of acquire is thread safe and correctly
@@ -1047,12 +1115,7 @@ impl AcquireFutInner {
 
         // Hand back permits which we've acquired so far.
         let release = permits.saturating_sub(remaining);
-
-        // Temporarily assume the role of core and release the remaining
-        // tokens to waiting tasks.
-        if release > 0 {
-            drain_wait_queue(critical, release, lim);
-        }
+        lim.add_tokens(critical, release, |_| ());
     }
 
     /// Drain the given number of tokens through the core. Returns `true` if the
@@ -1067,21 +1130,27 @@ impl AcquireFutInner {
         tokens: usize,
         lim: &RateLimiter,
     ) -> bool {
-        drain_wait_queue(critical, tokens, lim);
+        let completed = lim.add_tokens(critical, tokens, |critical| {
+            self.with_task_mut(critical, |critical, task| {
+                // If the limiter is not fair, we need to in addition to draining
+                // remaining tokens from linked nodes, drain it from ourselves. We
+                // fill the current holder of the core last (self). To ensure that
+                // it stays around for as long as possible.
+                if !lim.fair {
+                    task.fill(&mut critical.balance);
+                }
 
-        // We only need to check the state since the current core holder is
-        // linked up to the wait queue.
-        self.with_task_mut(critical, |critical, task| {
-            // If the limiter is not fair, we need to in addition to draining
-            // remaining tokens from linked nodes, drain it from ourselves. We
-            // fill the current holder of the core last (self). To ensure that
-            // it stays around for as long as possible.
-            if !lim.fair {
-                task.fill(&mut critical.balance);
-            }
+                task.is_completed()
+            })
+        });
 
-            task.is_completed()
-        })
+        if completed {
+            // Everything was drained, including the current core (if
+            // appropriate). So we can release it now.
+            critical.release();
+        }
+
+        completed
     }
 
     /// Assume the current core and calculate how long we must sleep for in
@@ -1110,69 +1179,7 @@ impl AcquireFutInner {
 
         // It is appropriate to update the deadline.
         critical.deadline = deadline;
-
-        if self.drain_core(critical, tokens, lim) {
-            // Everything was drained, including the current core. So we have to
-            // release it now.
-            critical.release();
-            return false;
-        }
-
-        true
-    }
-}
-
-/// Refill the wait queue with the given number of tokens.
-#[cfg_attr(
-    feature = "tracing",
-    tracing::instrument(skip(critical, lim), level = "trace")
-)]
-fn drain_wait_queue(critical: &mut MutexGuard<'_, Critical>, tokens: usize, lim: &RateLimiter) {
-    critical.balance = critical.balance.saturating_add(tokens);
-    trace!(tokens = tokens, "draining tokens");
-
-    let mut bump = 0;
-
-    // SAFETY: we're holding the lock guard to all the waiters so we can be
-    // sure that we have exclusive access to the wait queue.
-    unsafe {
-        while critical.balance > 0 {
-            let mut node = match critical.waiters.pop_back() {
-                Some(node) => node,
-                None => break,
-            };
-
-            let n = node.as_mut();
-            n.fill(&mut critical.balance);
-
-            trace! {
-                balance = critical.balance,
-                remaining = n.remaining,
-                "filled node",
-            };
-
-            if !n.is_completed() {
-                critical.waiters.push_back(node);
-                break;
-            }
-
-            n.complete.store(true, Ordering::Release);
-
-            if let Some(waker) = n.waker.take() {
-                waker.wake();
-            }
-
-            bump += 1;
-
-            if bump == BUMP_LIMIT {
-                MutexGuard::bump(critical);
-                bump = 0;
-            }
-        }
-    }
-
-    if critical.balance > lim.max {
-        critical.balance = lim.max;
+        !self.drain_core(critical, tokens, lim)
     }
 }
 
@@ -1414,34 +1421,31 @@ where
                 // release a lot of acquires and accumulate permits.
                 //
                 // This is tested for in the `test_idle` suite of tests.
-                if let Some((tokens, deadline)) = lim.calculate_drain(critical.deadline, now) {
-                    trace!(tokens = tokens, "inline drain");
-                    // We pre-emptively update the deadline of the core
-                    // since it might bump, and we don't want other
-                    // processes to observe that the deadline has been
-                    // reached.
-                    critical.deadline = deadline;
-                    drain_wait_queue(&mut critical, tokens, lim);
-                }
+                let tokens =
+                    if let Some((tokens, deadline)) = lim.calculate_drain(critical.deadline, now) {
+                        trace!(tokens = tokens, "inline drain");
+                        // We pre-emptively update the deadline of the core
+                        // since it might bump, and we don't want other
+                        // processes to observe that the deadline has been
+                        // reached.
+                        critical.deadline = deadline;
+                        tokens
+                    } else {
+                        0
+                    };
 
-                // Test the fast path first, where we simply subtract the
-                // permits available from the current balance.
-                if let Some(balance) = critical.balance.checked_sub(*permits) {
-                    critical.balance = balance;
+                let completed = lim.add_tokens(&mut critical, tokens, |critical| {
+                    internal.as_mut().with_task_mut(critical, |critical, task| {
+                        task.remaining = *permits;
+                        task.fill(&mut critical.balance);
+                        task.is_completed()
+                    })
+                });
+
+                if completed {
                     *state = State::Complete;
                     return Poll::Ready(());
                 }
-
-                let balance = mem::take(&mut critical.balance);
-
-                let remaining = *permits - balance;
-
-                // SAFETY: This is done in a pinned section, so we know that
-                // the linked section stays alive for the duration of this
-                // future due to pinning guarantees.
-                internal.as_mut().with_task_mut(&mut critical, |_, task| {
-                    task.remaining = remaining;
-                });
 
                 // Try to take over as core. If we're unsuccessful we just
                 // ensure that we're linked into the wait queue.
@@ -1525,7 +1529,6 @@ where
         critical.deadline = outer_now.unwrap_or_else(Instant::now) + lim.interval;
 
         if internal.drain_core(&mut critical, lim.refill, lim) {
-            critical.release();
             *state = State::Complete;
             return Poll::Ready(());
         }
