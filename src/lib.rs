@@ -1407,8 +1407,13 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let (lim, permits, state, mut sleep, internal) = self.project();
 
+        // Hold onto the critical lock for core operations, but only acquire it
+        // when strictly necessary.
         let mut critical;
-        let now;
+
+        // Hold onto any call to `Instant::now` which we might perform, so we
+        // don't have to get the current time multiple times.
+        let outer_now;
 
         match state {
             State::Complete => {
@@ -1424,7 +1429,7 @@ where
                 }
 
                 critical = lim.critical.lock();
-                now = Instant::now();
+                let now = Instant::now();
 
                 // If we've hit a deadline, calculate the number of tokens
                 // to drain and perform it in line here. This is necessary
@@ -1482,6 +1487,7 @@ where
                 // future due to pinning guarantees.
                 internal.link_core(&mut critical, lim);
                 *state = State::Core;
+                outer_now = Some(now);
             }
             State::Waiting => {
                 // If we are complete, then return as ready.
@@ -1505,7 +1511,7 @@ where
                     return Poll::Pending;
                 }
 
-                now = Instant::now();
+                let now = Instant::now();
 
                 // This is done in a pinned section, so we know that the linked
                 // section stays alive for the duration of this future due to
@@ -1518,10 +1524,11 @@ where
 
                 MutexGuard::bump(&mut critical);
                 *state = State::Core;
+                outer_now = Some(now);
             }
             State::Core => {
                 critical = lim.critical.lock();
-                now = Instant::now();
+                outer_now = None;
             }
         }
 
@@ -1545,11 +1552,8 @@ where
             return Poll::Pending;
         }
 
-        trace!(now = ?now, "sleep completed");
-        critical.deadline = now + lim.interval;
+        critical.deadline = outer_now.unwrap_or_else(Instant::now) + lim.interval;
 
-        // Safety: we know that we're the only one with access to core
-        // because we ensured it as we acquire the `available` lock.
         if internal.drain_core(&mut critical, lim.refill, lim) {
             critical.release();
             *state = State::Complete;
