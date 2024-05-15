@@ -47,51 +47,46 @@ impl<T> Node<T> {
     }
 
     /// Get the next node.
+    #[inline(always)]
     unsafe fn next(&self) -> Option<ptr::NonNull<Self>> {
-        let ptr = self.pointers.get() as *const _ as *const Option<ptr::NonNull<Self>>;
-        ptr::read(ptr)
+        ptr::addr_of_mut!((*self.pointers.get()).next).read()
     }
 
     /// Set the next node.
+    #[inline(always)]
     unsafe fn set_next(&mut self, node: Option<ptr::NonNull<Self>>) {
-        let ptr = self.pointers.get() as *mut Option<ptr::NonNull<Self>>;
-        ptr::write(ptr, node);
+        ptr::addr_of_mut!((*self.pointers.get()).next).write(node);
     }
 
     /// Take the next node.
     #[cfg(test)]
     unsafe fn take_next(&mut self) -> Option<ptr::NonNull<Self>> {
-        let ptr = self.pointers.get() as *mut Option<ptr::NonNull<Self>>;
-        ptr::replace(ptr, None)
+        ptr::addr_of_mut!((*self.pointers.get()).next).replace(None)
     }
 
     /// Get the previous node.
+    #[inline(always)]
     unsafe fn prev(&self) -> Option<ptr::NonNull<Self>> {
-        let ptr = self.pointers.get() as *const _ as *const Option<ptr::NonNull<Self>>;
-        let ptr = ptr.add(1);
-        ptr::read(ptr)
+        ptr::addr_of_mut!((*self.pointers.get()).prev).read()
     }
 
     /// Set the previous node.
+    #[inline(always)]
     unsafe fn set_prev(&mut self, node: Option<ptr::NonNull<Self>>) {
-        let ptr = self.pointers.get() as *mut Option<ptr::NonNull<Self>>;
-        let ptr = ptr.add(1);
-        ptr::write(ptr, node);
+        ptr::addr_of_mut!((*self.pointers.get()).prev).write(node);
     }
 
     /// Take the previous node.
+    #[inline(always)]
     unsafe fn take_prev(&mut self) -> Option<ptr::NonNull<Self>> {
-        let ptr = self.pointers.get() as *mut Option<ptr::NonNull<Self>>;
-        let ptr = ptr.add(1);
-        ptr::replace(ptr, None)
+        ptr::addr_of_mut!((*self.pointers.get()).prev).replace(None)
     }
 
-    /// Take both nodes at the same time.
+    /// Take both nodes.
+    #[inline(always)]
     unsafe fn take_pair(&mut self) -> (Option<ptr::NonNull<Self>>, Option<ptr::NonNull<Self>>) {
-        let next = self.pointers.get() as *mut Option<ptr::NonNull<Self>>;
-        let prev = next.add(1);
-        let next = ptr::replace(next, None);
-        let prev = ptr::replace(prev, None);
+        let next = ptr::addr_of_mut!((*self.pointers.get()).next).replace(None);
+        let prev = ptr::addr_of_mut!((*self.pointers.get()).prev).replace(None);
         (next, prev)
     }
 }
