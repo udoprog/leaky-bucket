@@ -1,92 +1,55 @@
 //! An intrusive linked list of waiters.
 
-use core::cell::UnsafeCell;
 use core::fmt;
 use core::marker;
 use core::ops;
 use core::ptr;
 
-struct Pointers<T> {
+pub struct Node<T> {
     /// The next node.
     next: Option<ptr::NonNull<Node<T>>>,
     /// The previous node.
     prev: Option<ptr::NonNull<Node<T>>>,
-    /// Avoids noalias heuristics from kicking in on references to a
-    /// `Pointers<T>` struct.
-    _pin: marker::PhantomPinned,
-}
-
-pub struct Node<T> {
-    /// We only access pointers through raw pointer manipulation to avoid
-    /// having noalias attributes being generated in the future.
-    ///
-    /// If we don't do this, intermediate references being used will cause
-    /// noalias to be added, which is a broken assumption.
-    pointers: UnsafeCell<Pointers<T>>,
     /// The value inside of the node.
     value: T,
+    /// Avoids noalias heuristics from kicking in on references to a `Node<T>`
+    /// struct.
+    _pin: marker::PhantomPinned,
 }
-
-// Safety: Node doesn't do anything inherently unsafe, it all depends on what's
-// stored in it.
-unsafe impl<T> Send for Node<T> where T: Send {}
-unsafe impl<T> Sync for Node<T> where T: Sync {}
 
 impl<T> Node<T> {
     /// Construct a new unlinked node.
     pub(crate) const fn new(value: T) -> Self {
         Self {
-            pointers: UnsafeCell::new(Pointers {
-                next: None,
-                prev: None,
-                _pin: marker::PhantomPinned,
-            }),
+            next: None,
+            prev: None,
             value,
+            _pin: marker::PhantomPinned,
         }
-    }
-
-    /// Get the next node.
-    #[inline(always)]
-    unsafe fn next(&self) -> Option<ptr::NonNull<Self>> {
-        ptr::addr_of_mut!((*self.pointers.get()).next).read()
     }
 
     /// Set the next node.
     #[inline(always)]
     unsafe fn set_next(&mut self, node: Option<ptr::NonNull<Self>>) {
-        ptr::addr_of_mut!((*self.pointers.get()).next).write(node);
+        ptr::addr_of_mut!(self.next).write(node);
     }
 
     /// Take the next node.
-    #[cfg(test)]
-    unsafe fn take_next(&mut self) -> Option<ptr::NonNull<Self>> {
-        ptr::addr_of_mut!((*self.pointers.get()).next).replace(None)
-    }
-
-    /// Get the previous node.
     #[inline(always)]
-    unsafe fn prev(&self) -> Option<ptr::NonNull<Self>> {
-        ptr::addr_of_mut!((*self.pointers.get()).prev).read()
+    unsafe fn take_next(&mut self) -> Option<ptr::NonNull<Self>> {
+        ptr::addr_of_mut!(self.next).replace(None)
     }
 
     /// Set the previous node.
     #[inline(always)]
     unsafe fn set_prev(&mut self, node: Option<ptr::NonNull<Self>>) {
-        ptr::addr_of_mut!((*self.pointers.get()).prev).write(node);
+        ptr::addr_of_mut!(self.prev).write(node);
     }
 
     /// Take the previous node.
     #[inline(always)]
     unsafe fn take_prev(&mut self) -> Option<ptr::NonNull<Self>> {
-        ptr::addr_of_mut!((*self.pointers.get()).prev).replace(None)
-    }
-
-    /// Take both nodes.
-    #[inline(always)]
-    unsafe fn take_pair(&mut self) -> (Option<ptr::NonNull<Self>>, Option<ptr::NonNull<Self>>) {
-        let next = ptr::addr_of_mut!((*self.pointers.get()).next).replace(None);
-        let prev = ptr::addr_of_mut!((*self.pointers.get()).prev).replace(None);
-        (next, prev)
+        ptr::addr_of_mut!(self.prev).replace(None)
     }
 }
 
@@ -133,8 +96,8 @@ impl<T> LinkedList<T> {
     /// use.
     #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace"))]
     pub(crate) unsafe fn push_front(&mut self, mut node: ptr::NonNull<Node<T>>) {
-        debug_assert!(node.as_ref().next().is_none());
-        debug_assert!(node.as_ref().prev().is_none());
+        debug_assert!(node.as_ref().next.is_none());
+        debug_assert!(node.as_ref().prev.is_none());
 
         if let Some(mut head) = self.head.take() {
             node.as_mut().set_next(Some(head));
@@ -164,8 +127,8 @@ impl<T> LinkedList<T> {
     pub(crate) unsafe fn push_back(&mut self, mut node: ptr::NonNull<Node<T>>) {
         trace!(head = ?self.head, tail = ?self.tail, node = ?node, "push_back");
 
-        debug_assert!(node.as_ref().next().is_none());
-        debug_assert!(node.as_ref().prev().is_none());
+        debug_assert!(node.as_ref().next.is_none());
+        debug_assert!(node.as_ref().prev.is_none());
 
         if let Some(mut tail) = self.tail.take() {
             node.as_mut().set_prev(Some(tail));
@@ -189,13 +152,12 @@ impl<T> LinkedList<T> {
             self.head = Some(next);
         } else {
             debug_assert_eq!(self.tail, Some(head));
-
             self.head = None;
             self.tail = None;
         }
 
-        debug_assert!(head.as_ref().prev().is_none());
-        debug_assert!(head.as_ref().next().is_none());
+        debug_assert!(head.as_ref().prev.is_none());
+        debug_assert!(head.as_ref().next.is_none());
         Some(head)
     }
 
@@ -211,13 +173,12 @@ impl<T> LinkedList<T> {
             self.tail = Some(prev);
         } else {
             debug_assert_eq!(self.head, Some(tail));
-
             self.head = None;
             self.tail = None;
         }
 
-        debug_assert!(tail.as_ref().prev().is_none());
-        debug_assert!(tail.as_ref().next().is_none());
+        debug_assert!(tail.as_ref().prev.is_none());
+        debug_assert!(tail.as_ref().next.is_none());
         Some(tail)
     }
 
@@ -226,7 +187,8 @@ impl<T> LinkedList<T> {
     pub(crate) unsafe fn remove(&mut self, mut node: ptr::NonNull<Node<T>>) {
         trace!(head = ?self.head, tail = ?self.tail, node = ?node, "remove");
 
-        let (next, prev) = node.as_mut().take_pair();
+        let next = node.as_mut().take_next();
+        let prev = node.as_mut().take_prev();
 
         if let Some(mut next) = next {
             next.as_mut().set_prev(prev);
