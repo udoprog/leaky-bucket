@@ -32,7 +32,7 @@ impl<T> Node<T> {
     }
 
     #[inline(always)]
-    pub(crate) fn linked(&self) -> bool {
+    pub(crate) fn is_linked(&self) -> bool {
         self.linked
     }
 
@@ -58,6 +58,23 @@ impl<T> Node<T> {
     #[inline(always)]
     unsafe fn take_prev(&mut self) -> Option<ptr::NonNull<Self>> {
         ptr::addr_of_mut!(self.prev).replace(None)
+    }
+}
+
+impl<T> ops::Deref for Node<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+impl<T> ops::DerefMut for Node<T>
+where
+    T: Unpin,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.value
     }
 }
 
@@ -250,20 +267,6 @@ impl<T> fmt::Debug for LinkedList<T> {
             .field("head", &self.head)
             .field("tail", &self.tail)
             .finish()
-    }
-}
-
-impl<T> ops::Deref for Node<T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        &self.value
-    }
-}
-
-impl<T> ops::DerefMut for Node<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.value
     }
 }
 
