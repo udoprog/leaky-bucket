@@ -6,7 +6,6 @@ use core::marker;
 use core::ops;
 use core::ptr;
 
-#[repr(C)]
 struct Pointers<T> {
     /// The next node.
     next: Option<ptr::NonNull<Node<T>>>,

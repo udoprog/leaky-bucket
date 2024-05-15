@@ -511,12 +511,12 @@ impl RateLimiter {
     }
 
     /// Try to acquire the given number of permits, returning `true` if the
-    /// given number of permits can be immediately acquired.
+    /// given number of permits were successfully acquired.
     ///
     /// If the scheduler is fair, and there are pending tasks waiting to acquire
     /// tokens this method will return `false`.
     ///
-    /// If zero permits are specified, this method returns `Ok(())`.
+    /// If zero permits are specified, this method returns `true`.
     ///
     /// # Examples
     ///
@@ -528,6 +528,7 @@ impl RateLimiter {
     ///
     /// assert!(limiter.try_acquire(1));
     /// assert!(!limiter.try_acquire(1));
+    /// assert!(limiter.try_acquire(0));
     ///
     /// tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     ///
@@ -537,6 +538,10 @@ impl RateLimiter {
     /// # }
     /// ```
     pub fn try_acquire(&self, permits: usize) -> bool {
+        if permits == 0 {
+            return true;
+        }
+
         let mut critical = self.critical.lock();
 
         if self.fair && (!critical.available || !critical.waiters.is_empty()) {
