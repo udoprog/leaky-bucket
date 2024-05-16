@@ -1077,10 +1077,10 @@ impl AcquireFutInner {
     /// We prove that the caller does indeed have mutable access to the node by
     /// passing in a mutable reference to the critical section.
     #[inline]
-    pub fn get_task<'this, 'crit: 'this, C>(
-        self: Pin<&'this mut Self>,
+    pub fn get_task<'crit, C>(
+        self: Pin<&'crit mut Self>,
         critical: &'crit mut C,
-    ) -> (&'crit mut C, &'this mut Node<Task>)
+    ) -> (&'crit mut C, &'crit mut Node<Task>)
     where
         C: IsCritical,
     {
@@ -1460,7 +1460,7 @@ where
                 // This is tested for in the `test_idle` suite of tests.
                 let tokens =
                     if let Some((tokens, deadline)) = lim.calculate_drain(critical.deadline, now) {
-                        trace!(tokens = tokens, "inline drain");
+                        trace!(tokens, "inline drain");
                         // We pre-emptively update the deadline of the core
                         // since it might bump, and we don't want other
                         // processes to observe that the deadline has been
