@@ -464,7 +464,14 @@ impl<'a> State<'a> {
         F: FnOnce(&mut Guard<'_>, &mut State) -> O,
     {
         if tokens > 0 {
-            self.balance += tokens.min(MAX_BALANCE);
+            debug_assert!(
+                tokens <= MAX_BALANCE,
+                "Additional tokens {} must be less than {}",
+                tokens,
+                MAX_BALANCE
+            );
+
+            self.balance = (self.balance + tokens).min(self.lim.max);
             drain_wait_queue(critical, self);
             let output = f(critical, self);
             return output;
@@ -485,8 +492,7 @@ impl<'a> State<'a> {
 
     #[inline]
     fn encode(&self) -> usize {
-        let balance = self.balance.min(self.lim.max);
-        (balance << 1) | usize::from(self.available)
+        (self.balance << 1) | usize::from(self.available)
     }
 
     /// Try to save the state, but only succeed if it hasn't been modified.
@@ -872,7 +878,10 @@ impl RateLimiter {
 
         let periods = usize::try_from(since / millis + 1).unwrap_or(usize::MAX);
 
-        let tokens = periods.checked_mul(self.refill).unwrap_or(MAX_BALANCE);
+        let tokens = periods
+            .checked_mul(self.refill)
+            .unwrap_or(MAX_BALANCE)
+            .min(MAX_BALANCE);
 
         let rem = u64::try_from(since % millis).unwrap_or(u64::MAX);
 
@@ -1126,17 +1135,21 @@ impl Builder {
     pub fn build(&self) -> RateLimiter {
         let deadline = Instant::now() + self.interval;
 
+        let initial = self.initial.min(MAX_BALANCE);
+        let refill = self.refill.min(MAX_BALANCE);
+
         let max = match self.max {
-            Some(max) => max,
-            None => usize::max(self.refill, self.initial).saturating_mul(DEFAULT_REFILL_MAX_FACTOR),
+            Some(max) => max.min(MAX_BALANCE),
+            None => refill
+                .max(initial)
+                .saturating_mul(DEFAULT_REFILL_MAX_FACTOR)
+                .min(MAX_BALANCE),
         };
 
-        let max = max.min(MAX_BALANCE);
-
-        let initial = usize::min(self.initial, max);
+        let initial = initial.min(max);
 
         RateLimiter {
-            refill: self.refill,
+            refill,
             interval: self.interval,
             max,
             fair: self.fair,

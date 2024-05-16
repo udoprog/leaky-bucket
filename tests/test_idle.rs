@@ -16,8 +16,6 @@ async fn test_idle_1() {
     time::sleep(Duration::from_millis(10000)).await;
 
     let start = Instant::now();
-    // This one is "free", since we've slept before acquiring it.
-    limiter.acquire_one().await;
 
     // These ones drain the available permits.
     for _ in 0..5 {
@@ -48,8 +46,6 @@ async fn test_idle_2() {
 
     time::sleep(Duration::from_millis(10000)).await;
 
-    // This one is "free", since it is within the time window we've slept.
-    limiter.acquire_one().await;
     let start = Instant::now();
 
     for _ in 0..5 {
