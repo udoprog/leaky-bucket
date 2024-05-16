@@ -607,7 +607,7 @@ impl RateLimiter {
             return true;
         }
 
-        let mut critical = self.critical.lock();
+        let mut critical = self.lock();
 
         if self.fair && (!critical.available || !critical.waiters.is_empty()) {
             return false;
@@ -641,10 +641,7 @@ impl RateLimiter {
             false
         };
 
-        if critical.balance > self.max {
-            critical.balance = self.max;
-        }
-
+        critical.balance = critical.balance.min(self.max);
         acquired
     }
 
