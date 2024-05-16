@@ -724,10 +724,6 @@ impl RateLimiter {
     /// # }
     /// ```
     pub fn try_acquire(&self, permits: usize) -> bool {
-        if permits == 0 {
-            return true;
-        }
-
         if self.try_fast_path(permits) {
             return true;
         }
@@ -854,6 +850,10 @@ impl RateLimiter {
 
     /// Try to use fast path.
     fn try_fast_path(&self, permits: usize) -> bool {
+        if permits == 0 {
+            return true;
+        }
+
         if self.fair {
             return false;
         }
@@ -1582,14 +1582,6 @@ where
                 return Poll::Ready(());
             }
             AcquireFutState::Initial => {
-                // SAFETY: The task is not linked up yet, so we can safely
-                // inspect the number of permits without having to
-                // synchronize.
-                if *permits == 0 {
-                    *state = AcquireFutState::Complete;
-                    return Poll::Ready(());
-                }
-
                 // If the rate limiter is not fair, try to oppurtunistically
                 // just acquire a permit through the known atomic state.
                 //
