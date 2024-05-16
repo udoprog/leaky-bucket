@@ -219,7 +219,7 @@ use core::cell::UnsafeCell;
 use core::convert::TryFrom as _;
 use core::future::Future;
 use core::mem;
-use core::ops::Deref;
+use core::ops::{Deref, DerefMut};
 use core::pin::Pin;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -251,11 +251,16 @@ const DEFAULT_REFILL_MAX_FACTOR: usize = 10;
 
 /// Interval to bump the shared mutex guard to allow other parts of the system
 /// to make process. Processes which loop should use this number to determine
-/// how many times it should loop before calling [MutexGuard::bump].
+/// how many times it should loop before calling [Guard::bump].
 ///
 /// If we do not respect this limit we might inadvertently end up starving other
 /// tasks from making progress so that they can unblock.
 const BUMP_LIMIT: usize = 16;
+
+/// Marker trait which indicates that a type represents a unique held critical section.
+trait IsCritical {}
+impl IsCritical for Critical {}
+impl IsCritical for Guard<'_> {}
 
 /// Linked task state.
 struct Task {
@@ -313,6 +318,33 @@ struct Critical {
     deadline: Instant,
     /// If the core is available.
     available: bool,
+}
+
+#[repr(transparent)]
+struct Guard<'a> {
+    critical: MutexGuard<'a, Critical>,
+}
+
+impl Guard<'_> {
+    fn bump(this: &mut Guard<'_>) {
+        MutexGuard::bump(&mut this.critical)
+    }
+}
+
+impl Deref for Guard<'_> {
+    type Target = Critical;
+
+    #[inline]
+    fn deref(&self) -> &Critical {
+        &self.critical
+    }
+}
+
+impl DerefMut for Guard<'_> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Critical {
+        &mut self.critical
+    }
 }
 
 impl Critical {
@@ -688,6 +720,13 @@ impl RateLimiter {
         }
     }
 
+    /// Lock the critical section of the rate limiter and return the associated guard.
+    fn lock(&self) -> Guard<'_> {
+        Guard {
+            critical: self.critical.lock(),
+        }
+    }
+
     /// Calculate refill amount. Returning a tuple of how much to fill and remaining
     /// duration to sleep until the next refill time if appropriate.
     fn calculate_drain(&self, deadline: Instant, now: Instant) -> Option<(usize, Instant)> {
@@ -718,9 +757,9 @@ impl RateLimiter {
         tracing::instrument(skip(self, critical, f), level = "trace")
     )]
     #[inline]
-    fn add_tokens<F, O>(&self, critical: &mut MutexGuard<'_, Critical>, tokens: usize, f: F) -> O
+    fn add_tokens<F, O>(&self, critical: &mut Guard<'_>, tokens: usize, f: F) -> O
     where
-        F: FnOnce(&mut MutexGuard<'_, Critical>) -> O,
+        F: FnOnce(&mut Guard<'_>) -> O,
     {
         if tokens > 0 {
             critical.balance = critical.balance.saturating_add(tokens);
@@ -736,7 +775,7 @@ impl RateLimiter {
 
 /// Refill the wait queue with the given number of tokens.
 #[cfg_attr(feature = "tracing", tracing::instrument(skip_all, level = "trace"))]
-fn drain_wait_queue(critical: &mut MutexGuard<'_, Critical>) {
+fn drain_wait_queue(critical: &mut Guard<'_>) {
     trace!(balance = critical.balance, "releasing waiters");
 
     let mut bump = 0;
@@ -773,7 +812,7 @@ fn drain_wait_queue(critical: &mut MutexGuard<'_, Critical>) {
             bump += 1;
 
             if bump == BUMP_LIMIT {
-                MutexGuard::bump(critical);
+                Guard::bump(critical);
                 bump = 0;
             }
         }
@@ -1041,14 +1080,17 @@ impl AcquireFutInner {
     /// We prove that the caller does indeed have mutable access to the node by
     /// passing in a mutable reference to the critical section.
     #[inline]
-    pub fn with_task_mut<F, O>(self: Pin<&mut Self>, critical: &mut Critical, f: F) -> O
+    pub fn get_task<'this, 'crit: 'this, C>(
+        self: Pin<&'this mut Self>,
+        critical: &'crit mut C,
+    ) -> (&'crit mut C, &'this mut Node<Task>)
     where
-        F: FnOnce(&mut Critical, &mut Node<Task>) -> O,
+        C: IsCritical,
     {
         // SAFETY: Caller has exclusive access to the critical section, since
         // it's passed in as a mutable argument. We can also ensure that none of
         // the borrows outlive the provided closure.
-        unsafe { f(critical, &mut *self.node.get()) }
+        unsafe { (critical, &mut *self.node.get()) }
     }
 
     /// Update the waiting state for this acquisition task. This might require
@@ -1057,22 +1099,22 @@ impl AcquireFutInner {
         feature = "tracing",
         tracing::instrument(skip(self, critical, waker), level = "trace")
     )]
-    fn update(self: Pin<&mut Self>, critical: &mut MutexGuard<'_, Critical>, waker: &Waker) {
-        self.with_task_mut(critical, |critical, task| {
-            if !task.is_linked() {
-                critical.push_task_front(task);
-            }
+    fn update(self: Pin<&mut Self>, critical: &mut Guard<'_>, waker: &Waker) {
+        let (critical, task) = self.get_task(critical);
 
-            let new_waker = match task.waker {
-                None => true,
-                Some(ref w) => !w.will_wake(waker),
-            };
+        if !task.is_linked() {
+            critical.push_task_front(task);
+        }
 
-            if new_waker {
-                trace!("updating waker");
-                task.waker = Some(waker.clone());
-            }
-        });
+        let new_waker = match task.waker {
+            None => true,
+            Some(ref w) => !w.will_wake(waker),
+        };
+
+        if new_waker {
+            trace!("updating waker");
+            task.waker = Some(waker.clone());
+        }
     }
 
     /// Ensure that the current core task is correctly linked up if needed.
@@ -1081,40 +1123,38 @@ impl AcquireFutInner {
         tracing::instrument(skip(self, critical, lim), level = "trace")
     )]
     fn link_core(self: Pin<&mut Self>, critical: &mut Critical, lim: &RateLimiter) {
-        self.with_task_mut(critical, |critical, task| {
-            match (lim.fair, task.is_linked()) {
-                (true, false) => {
-                    // Fair scheduling needs to ensure that the core is part of the wait
-                    // queue, and will be woken up in-order with other tasks.
-                    critical.push_task(task);
-                }
-                (false, true) => {
-                    // Unfair scheduling will not wake the core in order, so
-                    // don't bother having it linked.
-                    critical.remove_task(task);
-                }
-                _ => {}
+        let (critical, task) = self.get_task(critical);
+
+        match (lim.fair, task.is_linked()) {
+            (true, false) => {
+                // Fair scheduling needs to ensure that the core is part of the wait
+                // queue, and will be woken up in-order with other tasks.
+                critical.push_task(task);
             }
-        });
+            (false, true) => {
+                // Unfair scheduling will not wake the core in order, so
+                // don't bother having it linked.
+                critical.remove_task(task);
+            }
+            _ => {}
+        }
     }
 
     /// Release any remaining tokens which are associated with this particular task.
     fn release_remaining(
         self: Pin<&mut Self>,
-        critical: &mut MutexGuard<'_, Critical>,
+        critical: &mut Guard<'_>,
         permits: usize,
         lim: &RateLimiter,
     ) {
-        let remaining = self.with_task_mut(critical, |critical, task| {
-            if task.is_linked() {
-                critical.remove_task(task);
-            }
+        let (critical, task) = self.get_task(critical);
 
-            task.remaining
-        });
+        if task.is_linked() {
+            critical.remove_task(task);
+        }
 
         // Hand back permits which we've acquired so far.
-        let release = permits.saturating_sub(remaining);
+        let release = permits.saturating_sub(task.remaining);
         lim.add_tokens(critical, release, |_| ());
     }
 
@@ -1126,22 +1166,22 @@ impl AcquireFutInner {
     )]
     fn drain_core(
         self: Pin<&mut Self>,
-        critical: &mut MutexGuard<'_, Critical>,
+        critical: &mut Guard<'_>,
         tokens: usize,
         lim: &RateLimiter,
     ) -> bool {
         let completed = lim.add_tokens(critical, tokens, |critical| {
-            self.with_task_mut(critical, |critical, task| {
-                // If the limiter is not fair, we need to in addition to draining
-                // remaining tokens from linked nodes, drain it from ourselves. We
-                // fill the current holder of the core last (self). To ensure that
-                // it stays around for as long as possible.
-                if !lim.fair {
-                    task.fill(&mut critical.balance);
-                }
+            let (critical, task) = self.get_task(critical);
 
-                task.is_completed()
-            })
+            // If the limiter is not fair, we need to in addition to draining
+            // remaining tokens from linked nodes, drain it from ourselves. We
+            // fill the current holder of the core last (self). To ensure that
+            // it stays around for as long as possible.
+            if !lim.fair {
+                task.fill(&mut critical.balance);
+            }
+
+            task.is_completed()
         });
 
         if completed {
@@ -1166,7 +1206,7 @@ impl AcquireFutInner {
     )]
     fn assume_core(
         mut self: Pin<&mut Self>,
-        critical: &mut MutexGuard<'_, Critical>,
+        critical: &mut Guard<'_>,
         lim: &RateLimiter,
         now: Instant,
     ) -> bool {
@@ -1325,12 +1365,12 @@ pin_project! {
                     // While the node is linked into the wait queue we have to
                     // ensure it's only accessed under a lock, but once it's been
                     // unlinked we can do what we want with it.
-                    let mut critical = lim.critical.lock();
+                    let mut critical = lim.lock();
                     inner.release_remaining(&mut critical, *permits, lim);
                     *state = State::Complete;
                 }
                 State::Core { .. } => {
-                    let mut critical = lim.critical.lock();
+                    let mut critical = lim.lock();
                     inner.release_remaining(&mut critical, *permits, lim);
                     critical.release();
                     *state = State::Complete;
@@ -1404,7 +1444,7 @@ where
                     return Poll::Ready(());
                 }
 
-                critical = lim.critical.lock();
+                critical = lim.lock();
                 let now = Instant::now();
 
                 // If we've hit a deadline, calculate the number of tokens
@@ -1435,11 +1475,10 @@ where
                     };
 
                 let completed = lim.add_tokens(&mut critical, tokens, |critical| {
-                    internal.as_mut().with_task_mut(critical, |critical, task| {
-                        task.remaining = *permits;
-                        task.fill(&mut critical.balance);
-                        task.is_completed()
-                    })
+                    let (critical, task) = internal.as_mut().get_task(critical);
+                    task.remaining = *permits;
+                    task.fill(&mut critical.balance);
+                    task.is_completed()
                 });
 
                 if completed {
@@ -1459,7 +1498,7 @@ where
                 // the linked section stays alive for the duration of this
                 // future due to pinning guarantees.
                 internal.as_mut().link_core(&mut critical, lim);
-                MutexGuard::bump(&mut critical);
+                Guard::bump(&mut critical);
                 *state = State::Core;
                 outer_now = Some(now);
             }
@@ -1476,7 +1515,7 @@ where
                 // Note: we need to operate under this lock to ensure that
                 // the core acquired here (or elsewhere) observes that the
                 // current task has been linked up.
-                critical = lim.critical.lock();
+                critical = lim.lock();
 
                 // Try to take over as core. If we're unsuccessful we
                 // just ensure that we're linked into the wait queue.
@@ -1496,12 +1535,12 @@ where
                     return Poll::Ready(());
                 }
 
-                MutexGuard::bump(&mut critical);
+                Guard::bump(&mut critical);
                 *state = State::Core;
                 outer_now = Some(now);
             }
             State::Core => {
-                critical = lim.critical.lock();
+                critical = lim.lock();
                 outer_now = None;
             }
         }
