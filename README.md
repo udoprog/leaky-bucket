@@ -35,31 +35,38 @@ The core type is [`RateLimiter`], which allows for limiting the throughput
 of a section using its [`acquire`], [`try_acquire`], and [`acquire_one`]
 methods.
 
+The following is a simple example where we wrap requests through a HTTP
+`Client`, to ensure that we don't exceed a given limit:
+
 ```rust
 use leaky_bucket::RateLimiter;
-use tokio::time::Instant;
 
-let limiter = RateLimiter::builder()
-    .max(10)
-    .initial(0)
-    .refill(5)
-    .build();
+/// A blog client.
+pub struct BlogClient {
+    limiter: RateLimiter,
+    client: Client,
+}
 
-let start = Instant::now();
+struct Post {
+    // ..
+}
 
-println!("Waiting for permit...");
+impl BlogClient {
+    /// Get all posts from the service.
+    pub async fn get_posts(&self) -> Result<Vec<Post>> {
+        self.request("posts").await
+    }
 
-// Should take ~400 ms to acquire in total.
-let a = limiter.acquire(7);
-let b = limiter.acquire(3);
-let c = limiter.acquire(10);
-
-let ((), (), ()) = tokio::join!(a, b, c);
-
-println!(
-    "I made it in {:?}!",
-    Instant::now().duration_since(start)
-);
+    /// Perform a request against the service, limiting requests to abide by a rate limit.
+    async fn request<T>(&self, path: &str) -> Result<T>
+    where
+        T: DeserializeOwned
+    {
+        // Before we start sending a request, we block on acquiring one token.
+        self.limiter.acquire(1).await;
+        self.client.request::<T>(path).await
+    }
+}
 ```
 
 <br>
@@ -77,9 +84,8 @@ tasks will switch over to work as a *core*. This is known as *core
 switching*.
 
 ```rust
-use std::time::Duration;
-
 use leaky_bucket::RateLimiter;
+use tokio::time::Duration;
 
 let limiter = RateLimiter::builder()
     .initial(10)
@@ -112,7 +118,7 @@ guard.
 > You can run this example with:
 >
 > ```sh
-> cargo run --example block-forever
+> cargo run --example block_forever
 > ```
 
 ```rust
@@ -153,6 +159,9 @@ needed. An unfair scheduler is expected to do a bit less work under
 contention. But without fair scheduling some tasks might end up taking
 longer to acquire than expected.
 
+Unfair rate limiters also have access to a fast path for acquiring tokens,
+which might further improve throughput.
+
 This behavior can be tweaked with the [`Builder::fair`] option.
 
 ```rust
@@ -166,7 +175,7 @@ let limiter = RateLimiter::builder()
 The `unfair-scheduling` example can showcase this phenomenon.
 
 ```sh
-cargh run --example unfair-scheduling
+cargh run --example unfair_scheduling
 ```
 
 ```text

@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use leaky_bucket::RateLimiter;
-use tokio::time::{self, Duration};
+use tokio::time::{Duration, Instant};
 
 /// Test that a bunch of threads spinning on a rate limiter refilling a
 /// reasonable amount of tokens at a slowish rate reaches the given target.
@@ -20,7 +20,7 @@ async fn test_rate_limit_target() {
     let limiter = Arc::new(limiter);
     let c = Arc::new(AtomicUsize::new(0));
 
-    let start = time::Instant::now();
+    let start = Instant::now();
 
     let mut tasks = Vec::new();
 
@@ -39,6 +39,6 @@ async fn test_rate_limit_target() {
         t.await.unwrap();
     }
 
-    let duration = time::Instant::now().duration_since(start);
+    let duration = Instant::now().duration_since(start);
     assert_eq!(duration, Duration::from_secs(2));
 }
