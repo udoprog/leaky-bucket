@@ -1,6 +1,6 @@
 [package]
 name = "leaky-bucket"
-version = "1.1.0"
+version = "1.1.1"
 authors = ["John-John Tedro <udoprog@tedro.se>"]
 edition = "2018"
 rust-version = "1.63"
