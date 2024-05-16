@@ -254,11 +254,6 @@ impl<T> LinkedList<T> {
     pub(crate) unsafe fn front(&mut self) -> Option<ptr::NonNull<Node<T>>> {
         self.head
     }
-
-    /// Test if the list is empty.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.head.is_none()
-    }
 }
 
 impl<T> fmt::Debug for LinkedList<T> {
