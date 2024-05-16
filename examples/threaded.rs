@@ -1,7 +1,7 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::Result;
+use tokio::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<()> {

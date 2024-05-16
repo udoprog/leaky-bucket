@@ -1,4 +1,5 @@
 use leaky_bucket::RateLimiter;
+use tokio::time::Duration;
 
 #[tokio::main]
 async fn main() {
@@ -7,7 +8,7 @@ async fn main() {
     assert!(limiter.try_acquire(1));
     assert!(!limiter.try_acquire(1));
 
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
     assert!(limiter.try_acquire(1));
     assert!(limiter.try_acquire(1));

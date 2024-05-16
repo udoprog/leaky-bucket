@@ -1,8 +1,8 @@
 use std::sync::Arc;
-use std::time::Instant;
 
 use anyhow::Result;
 use leaky_bucket::RateLimiter;
+use tokio::time::Instant;
 
 /// Grind a rate limiter.
 async fn grind(what: &str, limiter: &Arc<RateLimiter>) -> Result<()> {

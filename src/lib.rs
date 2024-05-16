@@ -32,33 +32,43 @@
 //! of a section using its [`acquire`], [`try_acquire`], and [`acquire_one`]
 //! methods.
 //!
+//! The following is a simple example where we wrap requests through a HTTP
+//! `Client`, to ensure that we don't exceed a given limit:
+//!
 //! ```
 //! use leaky_bucket::RateLimiter;
-//! use tokio::time::Instant;
+//! # struct Client;
+//! # impl Client { async fn request<T>(&self, path: &str) -> Result<T> { todo!() } }
+//! # trait DeserializeOwned {}
+//! # impl DeserializeOwned for Vec<Post> {}
+//! # type Result<T> = core::result::Result<T, ()>;
 //!
-//! # #[tokio::main(flavor="current_thread", start_paused=true)] async fn main() {
-//! let limiter = RateLimiter::builder()
-//!     .max(10)
-//!     .initial(0)
-//!     .refill(5)
-//!     .build();
+//! /// A blog client.
+//! pub struct BlogClient {
+//!     limiter: RateLimiter,
+//!     client: Client,
+//! }
 //!
-//! let start = Instant::now();
+//! struct Post {
+//!     // ..
+//! }
 //!
-//! println!("Waiting for permit...");
+//! impl BlogClient {
+//!     /// Get all posts from the service.
+//!     pub async fn get_posts(&self) -> Result<Vec<Post>> {
+//!         self.request("posts").await
+//!     }
 //!
-//! // Should take ~400 ms to acquire in total.
-//! let a = limiter.acquire(7);
-//! let b = limiter.acquire(3);
-//! let c = limiter.acquire(10);
-//!
-//! let ((), (), ()) = tokio::join!(a, b, c);
-//!
-//! println!(
-//!     "I made it in {:?}!",
-//!     Instant::now().duration_since(start)
-//! );
-//! # }
+//!     /// Perform a request against the service, limiting requests to abide by a rate limit.
+//!     async fn request<T>(&self, path: &str) -> Result<T>
+//!     where
+//!         T: DeserializeOwned
+//!     {
+//!         // Before we start sending a request, we block on acquiring one token.
+//!         self.limiter.acquire(1).await;
+//!         self.client.request::<T>(path).await
+//!     }
+//! }
 //! ```
 //!
 //! <br>
@@ -76,9 +86,8 @@
 //! switching*.
 //!
 //! ```
-//! use std::time::Duration;
-//!
 //! use leaky_bucket::RateLimiter;
+//! use tokio::time::Duration;
 //!
 //! # #[tokio::main(flavor="current_thread", start_paused=true)] async fn main() {
 //! let limiter = RateLimiter::builder()
@@ -113,7 +122,7 @@
 //! > You can run this example with:
 //! >
 //! > ```sh
-//! > cargo run --example block-forever
+//! > cargo run --example block_forever
 //! > ```
 //!
 //! ```no_run
@@ -173,7 +182,7 @@
 //! The `unfair-scheduling` example can showcase this phenomenon.
 //!
 //! ```sh
-//! cargh run --example unfair-scheduling
+//! cargh run --example unfair_scheduling
 //! ```
 //!
 //! ```text
@@ -527,7 +536,7 @@ impl RateLimiter {
     ///
     /// ```
     /// use leaky_bucket::RateLimiter;
-    /// use std::time::Duration;
+    /// use tokio::time::Duration;
     ///
     /// let limiter = RateLimiter::builder()
     ///     .initial(100)
@@ -565,9 +574,8 @@ impl RateLimiter {
     /// # Examples
     ///
     /// ```
-    /// use std::time::Duration;
-    ///
     /// use leaky_bucket::RateLimiter;
+    /// use tokio::time::Duration;
     ///
     /// let limiter = RateLimiter::builder()
     ///     .interval(Duration::from_millis(1000))
@@ -693,6 +701,7 @@ impl RateLimiter {
     ///
     /// ```
     /// use leaky_bucket::RateLimiter;
+    /// use tokio::time::{self, Duration};
     ///
     /// # #[tokio::main(flavor="current_thread", start_paused=true)] async fn main() {
     /// let limiter = RateLimiter::builder().refill(1).initial(1).build();
@@ -701,7 +710,7 @@ impl RateLimiter {
     /// assert!(!limiter.try_acquire(1));
     /// assert!(limiter.try_acquire(0));
     ///
-    /// tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    /// time::sleep(Duration::from_millis(200)).await;
     ///
     /// assert!(limiter.try_acquire(1));
     /// assert!(limiter.try_acquire(1));
@@ -775,13 +784,13 @@ impl RateLimiter {
     /// to the corresponding [`RateLimiter`] instance.
     ///
     /// ```
-    /// use leaky_bucket::{AcquireOwned, RateLimiter};
-    /// use pin_project::pin_project;
     /// use std::future::Future;
     /// use std::pin::Pin;
     /// use std::sync::Arc;
     /// use std::task::{Context, Poll};
-    /// use std::time::Duration;
+    ///
+    /// use leaky_bucket::{AcquireOwned, RateLimiter};
+    /// use pin_project::pin_project;
     ///
     /// #[pin_project]
     /// struct MyFuture {
@@ -957,7 +966,7 @@ pub struct Builder {
 impl Builder {
     /// Configure the max number of tokens to use.
     ///
-    /// If unspecified, this will default to be 2 times the [`refill`] or the
+    /// If unspecified, this will default to be 10 times the [`refill`] or the
     /// [`initial`] value, whichever is largest.
     ///
     /// The maximum supported balance is limited to [`isize::MAX`].
@@ -999,6 +1008,8 @@ impl Builder {
     /// Configure the time duration between which we add [`refill`] number to
     /// the bucket rate limiter.
     ///
+    /// This is 100ms by default.
+    ///
     /// # Panics
     ///
     /// This panics if the provided interval does not fit within the millisecond
@@ -1006,19 +1017,19 @@ impl Builder {
     ///
     /// ```should_panic
     /// use leaky_bucket::RateLimiter;
-    /// use std::time;
+    /// use tokio::time::Duration;
     ///
     /// let limiter = RateLimiter::builder()
-    ///     .interval(time::Duration::from_secs(u64::MAX))
+    ///     .interval(Duration::from_secs(u64::MAX))
     ///     .build();
     /// ```
     ///
     /// ```should_panic
     /// use leaky_bucket::RateLimiter;
-    /// use std::time;
+    /// use tokio::time::Duration;
     ///
     /// let limiter = RateLimiter::builder()
-    ///     .interval(time::Duration::from_millis(0))
+    ///     .interval(Duration::from_millis(0))
     ///     .build();
     /// ```
     ///
@@ -1026,15 +1037,15 @@ impl Builder {
     ///
     /// ```
     /// use leaky_bucket::RateLimiter;
-    /// use std::time;
+    /// use tokio::time::Duration;
     ///
     /// let limiter = RateLimiter::builder()
-    ///     .interval(time::Duration::from_millis(100))
+    ///     .interval(Duration::from_millis(100))
     ///     .build();
     /// ```
     ///
     /// [`refill`]: Builder::refill
-    pub fn interval(&mut self, interval: time::Duration) -> &mut Self {
+    pub fn interval(&mut self, interval: Duration) -> &mut Self {
         assert! {
             interval.as_millis() != 0,
             "interval must be non-zero",
@@ -1058,7 +1069,6 @@ impl Builder {
     ///
     /// ```
     /// use leaky_bucket::RateLimiter;
-    /// use std::time;
     ///
     /// let limiter = RateLimiter::builder()
     ///     .refill(100)
@@ -1105,11 +1115,11 @@ impl Builder {
     ///
     /// ```
     /// use leaky_bucket::RateLimiter;
-    /// use std::time;
+    /// use tokio::time::Duration;
     ///
     /// let limiter = RateLimiter::builder()
     ///     .refill(100)
-    ///     .interval(time::Duration::from_millis(200))
+    ///     .interval(Duration::from_millis(200))
     ///     .max(10_000)
     ///     .build();
     /// ```
@@ -1154,7 +1164,7 @@ impl Default for Builder {
             max: None,
             initial: 0,
             refill: 1,
-            interval: time::Duration::from_millis(100),
+            interval: Duration::from_millis(100),
             fair: true,
         }
     }

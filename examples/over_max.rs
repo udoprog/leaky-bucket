@@ -1,6 +1,5 @@
-use std::time;
-
 use leaky_bucket::RateLimiter;
+use tokio::time::Instant;
 
 #[tokio::main]
 async fn main() {
@@ -10,7 +9,7 @@ async fn main() {
     // because each acquisition is tracked separately.
     let limiter = RateLimiter::builder().max(0).initial(0).refill(5).build();
 
-    let start = time::Instant::now();
+    let start = Instant::now();
 
     println!("Waiting for permit...");
 
@@ -21,8 +20,5 @@ async fn main() {
 
     let ((), (), ()) = tokio::join!(a, b, c);
 
-    println!(
-        "I made it in {:?}!",
-        time::Instant::now().duration_since(start)
-    );
+    println!("I made it in {:?}!", Instant::now().duration_since(start));
 }
