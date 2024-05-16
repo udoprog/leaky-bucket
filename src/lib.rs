@@ -182,7 +182,7 @@
 //! The `unfair-scheduling` example can showcase this phenomenon.
 //!
 //! ```sh
-//! cargh run --example unfair_scheduling
+//! cargo run --example unfair_scheduling
 //! ```
 //!
 //! ```text
