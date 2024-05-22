@@ -503,8 +503,8 @@ impl<'a> State<'a> {
         match this.lim.state.compare_exchange(
             this.state,
             this.encode(),
-            Ordering::SeqCst,
-            Ordering::SeqCst,
+            Ordering::Release,
+            Ordering::Relaxed,
         ) {
             Ok(_) => Ok(()),
             Err(state) => Err(State::decode(state, this.lim)),
@@ -707,7 +707,7 @@ impl RateLimiter {
     ///
     /// ```
     /// use leaky_bucket::RateLimiter;
-    /// use tokio::time::{self, Duration};
+    /// use tokio::time;
     ///
     /// # #[tokio::main(flavor="current_thread", start_paused=true)] async fn main() {
     /// let limiter = RateLimiter::builder().refill(1).initial(1).build();
@@ -716,7 +716,7 @@ impl RateLimiter {
     /// assert!(!limiter.try_acquire(1));
     /// assert!(limiter.try_acquire(0));
     ///
-    /// time::sleep(Duration::from_millis(200)).await;
+    /// time::sleep(limiter.interval() * 2).await;
     ///
     /// assert!(limiter.try_acquire(1));
     /// assert!(limiter.try_acquire(1));
@@ -747,7 +747,7 @@ impl RateLimiter {
         // release a sufficient number of tokens to allow the current task
         // to proceed.
         if let Some((tokens, deadline)) = self.calculate_drain(critical.deadline, now) {
-            state.balance = state.balance.saturating_add(tokens);
+            state.balance = (state.balance + tokens).min(self.max);
             critical.deadline = deadline;
         }
 
@@ -967,7 +967,7 @@ pub struct Builder {
     /// Tokens to add every `per` duration.
     refill: usize,
     /// Interval to add tokens in milliseconds.
-    interval: time::Duration,
+    interval: Duration,
     /// If the rate limiter is fair or not.
     fair: bool,
 }

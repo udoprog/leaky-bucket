@@ -4,9 +4,7 @@ use std::sync::Arc;
 use std::task::Context;
 
 use leaky_bucket::RateLimiter;
-use tokio::time::{self, Duration};
-
-const INTERVAL: Duration = Duration::from_millis(100);
+use tokio::time;
 
 struct Waker;
 
@@ -21,7 +19,7 @@ async fn test_try_acquire() {
     assert!(limiter.try_acquire(1));
     assert!(!limiter.try_acquire(1));
 
-    time::sleep(Duration::from_millis(200)).await;
+    time::sleep(limiter.interval() * 2).await;
 
     assert!(limiter.try_acquire(1));
     assert!(limiter.try_acquire(1));
@@ -30,11 +28,7 @@ async fn test_try_acquire() {
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_try_acquire_contended() {
-    let limiter = RateLimiter::builder()
-        .interval(INTERVAL)
-        .refill(2)
-        .initial(1)
-        .build();
+    let limiter = RateLimiter::builder().refill(2).initial(1).build();
 
     let waker = Arc::new(Waker).into();
     let mut cx = Context::from_waker(&waker);
@@ -48,8 +42,15 @@ async fn test_try_acquire_contended() {
         assert!(!limiter.try_acquire(1));
     }
 
-    time::sleep(INTERVAL).await;
+    time::sleep(limiter.interval()).await;
 
     assert!(limiter.try_acquire(2));
     assert!(!limiter.try_acquire(1));
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_try_acquire_max() {
+    let limiter = RateLimiter::builder().refill(100).initial(1).max(1).build();
+    time::sleep(limiter.interval()).await;
+    assert!(!limiter.try_acquire(2));
 }
