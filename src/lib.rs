@@ -1153,7 +1153,7 @@ impl Builder {
             interval: self.interval,
             max,
             fair: self.fair,
-            state: AtomicUsize::new(initial << 1 | 1),
+            state: AtomicUsize::new((initial << 1) | 1),
             critical: Mutex::new(Critical {
                 waiters: LinkedList::new(),
                 deadline,
