@@ -695,6 +695,42 @@ impl RateLimiter {
         }
     }
 
+    /// Forces a refill check without consuming any tokens.
+    ///
+    /// This method calculates and adds any tokens that should be added based on the elapsed time
+    /// since the last refill, without consuming any tokens. This is useful for ensuring the token
+    /// bucket is up-to-date before checking the balance or performing other operations.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use leaky_bucket::RateLimiter;
+    /// use tokio::time::Duration;
+    ///
+    /// # #[tokio::main(flavor="current_thread", start_paused=true)] async fn main() {
+    /// let limiter = RateLimiter::builder()
+    ///     .initial(10)
+    ///     .refill(10)
+    ///     .interval(Duration::from_millis(100))
+    ///     .build();
+    ///
+    /// // Force a refill check without consuming tokens
+    /// limiter.probe_refill();
+    ///
+    /// assert_eq!(limiter.balance(), 10);
+    /// # }
+    /// ```
+    pub fn probe_refill(&self) {
+        let mut critical = self.lock();
+        let mut state = self.take();
+        let now = Instant::now();
+
+        if let Some((tokens, deadline)) = self.calculate_drain(critical.deadline, now) {
+            state.balance = (state.balance + tokens).min(self.max);
+            critical.deadline = deadline;
+        }
+    }
+
     /// Try to acquire the given number of permits, returning `true` if the
     /// given number of permits were successfully acquired.
     ///
