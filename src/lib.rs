@@ -1503,7 +1503,7 @@ pin_project! {
 
             let is_core = match *state {
                 AcquireFutState::Waiting => false,
-                AcquireFutState::Core { .. } => true,
+                AcquireFutState::Core => true,
                 _ => return,
             };
 
@@ -1536,7 +1536,7 @@ where
     }
 
     fn is_core(&self) -> bool {
-        matches!(&self.state, AcquireFutState::Core { .. })
+        matches!(&self.state, AcquireFutState::Core)
     }
 }
 
