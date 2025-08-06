@@ -20,7 +20,7 @@ async fn test_overflow() {
     }
 
     let elapsed = Instant::now().duration_since(begin);
-    println!("Elapsed: {:?}", elapsed);
+    println!("Elapsed: {elapsed:?}");
     assert!(elapsed.as_millis() >= 500 && elapsed.as_millis() <= 550);
 }
 
@@ -38,6 +38,6 @@ async fn test_overflow_2() {
     limiter.acquire(10).await;
 
     let elapsed = Instant::now().duration_since(begin);
-    println!("Elapsed: {:?}", elapsed);
+    println!("Elapsed: {elapsed:?}");
     assert!(elapsed.as_millis() >= 500 && elapsed.as_millis() <= 550);
 }

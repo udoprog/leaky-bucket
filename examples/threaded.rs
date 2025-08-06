@@ -28,7 +28,7 @@ async fn main() -> Result<()> {
 
                 for i in 0..10 {
                     limiter.acquire(10).await;
-                    println!("tick: {}:{}:{}", iteration, n, i);
+                    println!("tick: {iteration}:{n}:{i}");
                     locals.push((n, i));
                 }
 

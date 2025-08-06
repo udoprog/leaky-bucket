@@ -13,7 +13,7 @@ pub struct Node<T> {
     /// If we are linked or not.
     linked: bool,
     /// The value inside of the node.
-    value: T,
+    pub(crate) value: T,
     /// Avoids noalias heuristics from kicking in on references to a `Node<T>`
     /// struct.
     _pin: marker::PhantomPinned,

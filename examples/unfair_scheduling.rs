@@ -30,16 +30,15 @@ async fn grind(what: &str, limiter: &Arc<RateLimiter>) -> Result<()> {
 
     let max = results.iter().max().unwrap();
 
-    println!("# {}", what);
+    println!("# {what}");
     println! {
-        "Max: {}ms, Total: {}ms",
-        max, total
+        "Max: {max}ms, Total: {total}ms"
     };
 
     println!("Timings:");
 
     for (i, n) in results.iter().enumerate().take(5) {
-        println!(" {}: {}ms", i, n);
+        println!(" {i}: {n}ms");
     }
 
     println!(" ...");
